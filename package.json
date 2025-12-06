@@ -1,6 +1,6 @@
 {
-  "name": "custom-pm2",
-  "module": "./projects/client/index.ts",
+  "name": "@airplanegobrr/custom-pm2",
+  "main": "./projects/client/index.ts",
   "types": "./projects/types.d.ts",
   "type": "module",
   "private": true,
