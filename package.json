@@ -1,0 +1,22 @@
+{
+  "name": "custom-pm2",
+  "module": "./projects/client/index.ts",
+  "types": "./projects/types.d.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "server": "cd projects/server && bun server.ts",
+    "serverPM2": "cd projects/server && pm2 start --name \"Better PM2\" --interpreter ~/.bun/bin/bun server.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@types/express": "^5.0.6",
+    "axios": "^1.13.2",
+    "express": "^5.2.1"
+  }
+}
