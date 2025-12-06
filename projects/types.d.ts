@@ -23,3 +23,5 @@ export interface ManagedProcess {
     status: "stopped" | "error" | "online";
     restart: boolean;
 }
+
+export class ProcClient {}
