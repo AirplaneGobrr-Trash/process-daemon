@@ -1,198 +1,224 @@
-import { spawn } from "child_process";
+import pidusage from "pidusage";
+
+import { Status, type ProcessOptions, type ProcessOptionsConfirmed, type Stat } from "../types.ts";
 import path from "path";
-import fs from "fs";
-import type { ManagedProcess, ProcessOptions, CustomSpawn } from "../types";
-
-export const processes: ManagedProcess[] = [];
-
-let processIdCounter = 1;
+import fs from "fs/promises";
+import { EventEmitter } from "events";
 
 export const logDir = path.join(process.cwd(), "logs");
-fs.mkdirSync(logDir, { recursive: true });
+await fs.mkdir(logDir, { recursive: true });
 
-// Where we save state
-const dataDir = path.join(process.cwd());
-const dbPath = path.join(dataDir, "processes.json");
-
-fs.mkdirSync(dataDir, { recursive: true });
-
-// ---------- PERSISTENCE LAYER ----------
-
-function saveProcesses() {
-    const toSave = processes.map(p => ({
-        id: p.id,
-        name: p.name,
-        config: p.config,
-        restart: p.restart
-    }));
-
-    fs.writeFileSync(dbPath, JSON.stringify(toSave, null, 2));
+async function checkExists(path: string) {
+    try {
+        await fs.access(path);
+        return true;
+    } catch {
+        // Does not exist
+    }
+    return false;
 }
 
-export function loadProcesses() {
-    if (!fs.existsSync(dbPath)) return;
+function formatBytes(bytes: string | number, decimals = 2) {
+    bytes = Number(bytes);
+    if (!+bytes) return '0 Bytes'
 
-    const raw = fs.readFileSync(dbPath, "utf8");
-    if (!raw.trim()) return;
+    const k = 1024
+    const dm = decimals < 0 ? 0 : decimals
+    const sizes = ['Bytes', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB']
 
-    const arr: any[] = JSON.parse(raw);
+    const i = Math.floor(Math.log(bytes) / Math.log(k))
 
-    for (const saved of arr) {
-        // update ID counter so we don't conflict
-        const idNum = Number(saved.id);
-        processIdCounter = Math.max(processIdCounter, idNum) + 1;
-        
-
-        const proc = startProc(saved.config, idNum);
-        proc.id = saved.id;
-        proc.restart = saved.restart ?? false;
-    }
+    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`
 }
 
-// ---------- PROCESS MANAGER ----------
+export class Process extends EventEmitter {
+    public info: ProcessOptionsConfirmed;
+    private spawned?: Bun.Subprocess;
 
-export function startProc(options: ProcessOptions | string, forcedID?: number) {
-    if (typeof options === "string") {
-        throw new Error("start(string) not implemented");
+    public lastExit?: number;
+    public lastCode?: number | null;
+    public lastError?: string;
+    public fileName?: string;
+    public fileInc: number = 0;
+
+    public removed: boolean = false;
+    public status: Status = Status.Stopped;
+    public restartCount: number = 0;
+
+    private _stopping = false;
+
+    public monit?: Stat;
+
+    constructor(info: ProcessOptions) {
+        super();
+        if (!info?.script?.trim()) info.script = ".";
+        info.interpreter ||= "bun";
+
+        // @ts-ignore
+        this.info = info;
     }
 
-    const { name, script = ".", cwd, interpreter = "bun", restart = true } = options;
-
-    const proc: ManagedProcess = {
-        id: forcedID ? String(forcedID) : String(processIdCounter++),
-        name,
-        config: options,
-        started: Date.now(),
-        restart: restart,
-        status: "stopped"
-    };
-
-    const logOutPath = path.join(logDir, `${proc.id}.out.log`);
-    const logErrorPath = path.join(logDir, `${proc.id}.err.log`);
-
-    function getOutputFiles() {
-        fs.writeFileSync(logOutPath, "");
-        fs.writeFileSync(logErrorPath, "");
-
-        const out = fs.createWriteStream(logOutPath, { flags: "a" });
-        const err = fs.createWriteStream(logErrorPath, { flags: "a" });
-        return { out, err }
+    async getLogFile(path: string) {
+        const file = Bun.file(path);
+        if (!file.exists()) await Bun.write(file, "");
+        return file
     }
 
-    function spawnProcess() {
-        const { out, err } = getOutputFiles();
-        const child: CustomSpawn = spawn(interpreter, [script], {
-            cwd,
-            env: process.env,
-            stdio: ["ignore", "pipe", "pipe"]
-        });
+    async getLogFiles(newFile: boolean = false) {
+        const newF = newFile || !this.fileName
+        // If we are making a new file or no file name
+        if (newF) this.fileName = `${this.info.name.replaceAll("/", "_")}-${Bun.randomUUIDv7().split("-").pop()}-${this.fileInc++}`
 
-        proc.child = child;
-        proc.status = "online";
+        // We should really cache the results below??
+        const outputLogFile = await this.getLogFile(path.join(logDir, `${this.fileName}.out.log`));
+        const outputErrLogFile = await this.getLogFile(path.join(logDir, `${this.fileName}.err.log`));
 
-        out.write(`-- Started '${proc.name}' --\n`);
-        err.write(`-- Started '${proc.name}' --\n`);
+        return {
+            outputLogFile,
+            outputErrLogFile
+        }
+    }
 
-        child.stdout?.pipe(out, { end: false });
-        child.stderr?.pipe(err, { end: false });
+    async readLogFiles() {
+        if (!this.fileName) return { out: "", err: "" };
 
-        child.on("exit", (code) => {
-            proc.lastExit = Date.now();
-            proc.lastCode = code;
-            proc.status = "error";
-            if (out.writable) out.write(`-- Exited with code '${code}' --\n`);
-            if (err.writable) err.write(`-- Exited with code '${code}' --\n`);
+        const { outputLogFile, outputErrLogFile } = await this.getLogFiles();
+        return {
+            out: await outputLogFile.text(),
+            err: await outputErrLogFile.text()
+        }
+    }
 
-            out.end();
-            err.end();
+    async start() {
+        if (this.removed) return;
+        if (this.spawned && !this.spawned.exited) return;
+        const that = this;
 
-            if (proc.restart && !child.__noRestart) {
-                setTimeout(spawnProcess, 5 * 1000);
+        // TODO: restart lockout
+        // Not sure how to do that lols!
+
+        this.status = Status.Starting;
+
+        // Safety checks:
+
+        // Check if interpreter exists
+        if (!Bun.which(this.info.interpreter)) {
+            this.lastError = "No interpreter";
+            return;
+        }
+
+        // Check if CWD exists
+        if (!await checkExists(this.info.cwd)) {
+            this.lastError = "No CWD Exists";
+            return;
+        }
+
+        // Check if script exists
+        if (this.info.script != ".") {
+            const scriptPath = path.join(this.info.cwd, this.info.script);
+            if (!await Bun.file(scriptPath).exists()) {
+                this.lastError = "No Script Exists";
+                return;
             }
+        }
+
+        const { outputLogFile, outputErrLogFile } = await this.getLogFiles(true);
+        console.log(outputLogFile)
+        const outWriter = outputLogFile.writer();
+        const errWriter = outputErrLogFile.writer();
+
+        const proc = Bun.spawn({
+            cmd: [this.info.interpreter, this.info.script],
+            env: {
+                ...process.env,
+                ...this.info.env
+            },
+            cwd: this.info.cwd,
+            // stdout: outputLogFile,
+            // stderr: outputErrLogFile,
+
+            stdout: "pipe",
+            stderr: "pipe",
+
+            onExit(subprocess, exitCode, signalCode, error) {
+                that.lastExit = new Date().valueOf();
+                that.lastCode = exitCode;
+
+                if (error || exitCode !== 0) {
+                    that.status = Status.Error;
+                } else {
+                    that.status = Status.Stopped;
+                }
+
+                if (that.info.restart && !that._stopping) {
+                    that.spawned = undefined;
+                    that.restartCount += 1;
+                    setTimeout(() => that.start(), 5 * 1000);
+                }
+            },
         });
+
+        this.status = Status.Online;
+        this.spawned = proc;
+
+        (async () => {
+            for await (const chunk of proc.stdout) {
+                outWriter.write(chunk);
+                that.emit("out", {
+                    type: "out",
+                    line: new TextDecoder().decode(chunk)
+                });
+            }
+            await outWriter.end();
+        })();
+
+        (async () => {
+            for await (const chunk of proc.stderr) {
+                errWriter.write(chunk);
+                that.emit("out", {
+                    type: "err",
+                    line: new TextDecoder().decode(chunk)
+                });
+            }
+            await errWriter.end();
+        })();
+
     }
 
-    spawnProcess();
-
-    processes.push(proc);
-    saveProcesses(); // 🔥 save on start
-
-    return proc;
-}
-
-export function logsProc(id: string) {
-    const logOutPath = path.join(logDir, `${id}.out.log`);
-    const logErrorPath = path.join(logDir, `${id}.err.log`);
-
-    const logs = fs.readFileSync(logOutPath);
-    const errors = fs.readFileSync(logErrorPath);
-
-    return {
-        logs, errors
-    }
-}
-
-
-export function deleteProc(id: string) {
-    const index = processes.findIndex(p => p.id === id);
-    if (index === -1) return;
-
-    const proc = processes[index];
-    if (!proc) return;
-
-    proc.restart = false;
-    if (proc.child) {
-        proc.child.__noRestart = true;
-        proc.child.kill("SIGTERM");
+    async getResourceUsage() {
+        if (!this.spawned) return;
+        const usage = await pidusage(this.spawned.pid);
+        this.monit = usage;
+        return usage;
     }
 
-    processes.splice(index, 1);
-    saveProcesses(); // 🔥 save after removal
-}
+    async stop() {
+        if (this.removed) return;
 
-export function restartProc(id: string) {
-    const old = processes.find(p => p.id === id);
-    if (!old) throw new Error("Process not found");
+        this.status = Status.Stopping;
 
-    if (old.child) {
-        old.child.__noRestart = true;
-        old.child.kill("SIGTERM");
+        this._stopping = true;
+        this.spawned?.kill();
+        await this.spawned?.exited
+        this._stopping = false;
+
+        this.status = Status.Stopped;
     }
 
-    const newProc = startProc(old.config);
-    newProc.id = old.id;      // preserve ID
-    newProc.restart = old.restart;
+    async restart() {
+        if (this.removed) return;
 
-    // swap
-    const index = processes.findIndex(p => p.id === id);
-    processes[index] = newProc;
+        await this.stop();
 
-    saveProcesses();
+        await this.start();
+    }
 
-    return newProc;
-}
+    async remove() {
+        if (this.removed) return;
+        await this.stop();
+        // Clear properties
+        this.spawned = undefined;
+        this.removed = true;
+    }
 
-export function list() {
-    return processes.map(p => ({
-        id: p.id,
-        name: p.name,
-        pid: p.child?.pid || null,
-        script: p.config.script,
-        interpreter: p.config.interpreter ?? "bun",
-        cwd: p.config.cwd,
-        lastExit: p.lastExit,
-        lastCode: p.lastCode,
-        uptime: p.child ? Date.now() - p.started : 0,
-        status: p.status,
-        restart: p.restart
-    }));
-}
-
-export default {
-    startProc,
-    deleteProc,
-    list,
-    restartProc,
-    loadProcesses,
-    logDir
 }

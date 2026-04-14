@@ -1,0 +1,8 @@
+POST http://10.0.10.20:3830/start
+Content-Type: application/json
+
+{
+    "cwd": "/home/apgb-node/Github/custom-pm2",
+    "script": "test.script.ts",
+    "name": "Test script"
+}
