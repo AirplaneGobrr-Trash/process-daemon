@@ -60,7 +60,7 @@ export class Process extends EventEmitter {
 
     async getLogFile(path: string) {
         const file = Bun.file(path);
-        if (!file.exists()) await Bun.write(file, "");
+        if (!await file.exists()) await Bun.write(file, "");
         return file
     }
 
@@ -104,12 +104,14 @@ export class Process extends EventEmitter {
         // Check if interpreter exists
         if (!Bun.which(this.info.interpreter)) {
             this.lastError = "No interpreter";
+            this.status = Status.Error;
             return;
         }
 
         // Check if CWD exists
         if (!await checkExists(this.info.cwd)) {
             this.lastError = "No CWD Exists";
+            this.status = Status.Error;
             return;
         }
 
@@ -118,12 +120,12 @@ export class Process extends EventEmitter {
             const scriptPath = path.join(this.info.cwd, this.info.script);
             if (!await Bun.file(scriptPath).exists()) {
                 this.lastError = "No Script Exists";
+                this.status = Status.Error;
                 return;
             }
         }
 
         const { outputLogFile, outputErrLogFile } = await this.getLogFiles(true);
-        console.log(outputLogFile)
         const outWriter = outputLogFile.writer();
         const errWriter = outputErrLogFile.writer();
 

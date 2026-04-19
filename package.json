@@ -13,7 +13,7 @@
     "link": "cd projects/client && bun link"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "^1.3.12"
   },
   "peerDependencies": {
     "typescript": "^5"

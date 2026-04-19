@@ -9,14 +9,14 @@ const app = express();
 app.use(express.json())
 
 await proc.respawn();
+const internalKeys = new Set(["save", "respawn", "getProjects"]);
 const procKeys = Object.keys(proc) as Array<keyof typeof proc>;
 
 for (const key of procKeys) {
+    if (internalKeys.has(key)) continue;
     const fn = proc[key];
 
     if (typeof fn === "function") {
-        // console.log(key, fn.length);
-
         let route = `/${key}`;
 
         if (fn.length == 1) {
@@ -42,8 +42,6 @@ interface ActionBody {
 // });
 
 app.post("/start", async (req, res) => {
-    console.log(req.body)
-
     const body = req.body as ProcessOptions & { env?: Record<string, string> };
 
     const process = await proc.start({
@@ -71,8 +69,6 @@ app.get("/logs/:id", async (req, res) => {
 
     const logs = await project.process?.readLogFiles();
     if (!logs) return res.send("No logs / Process not running");
-
-    console.log(logs);
 
     let text;
 

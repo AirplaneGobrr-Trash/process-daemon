@@ -4,7 +4,7 @@ import { Process } from "./process";
 const procs: ProcessInfo[] = [];
 
 const saveFile = Bun.file("./processes.json");
-if (!saveFile.exists()) await Bun.write(saveFile, JSON.stringify([]), { createPath: true });
+if (!await saveFile.exists()) await Bun.write(saveFile, JSON.stringify([]), { createPath: true });
 
 async function save() {
     await Bun.write(saveFile, JSON.stringify(procs));
@@ -64,10 +64,13 @@ function getProjects(getter: Getter): ProcessInfo[] {
         return [...procs];
     }
     const id = Number(getter);
-    if (Number.isInteger(id)) {
-        let proc = procs.find(v => v.id === id);
+    if (!isNaN(id) && Number.isInteger(id)) {
+        const proc = procs.find(v => v.id === id);
         if (proc) return [proc];
     }
+    // Fall back to name lookup
+    const byName = procs.find(v => v.name === getter);
+    if (byName) return [byName];
     return [];
 }
 
@@ -108,13 +111,12 @@ async function remove(getter: Getter) {
     for (let proc of projects) {
         const idx = procs.findIndex(v => v.id === proc.id);
         if (idx !== -1) procs.splice(idx, 1);
-
     }
-    return null;
+    return projects;
 }
 
 async function list() {
-    let e = await Promise.all(procs.map(v=>v.process?.getResourceUsage()));
+    await Promise.all(procs.map(v => v.process?.getResourceUsage()));
     return [...procs];
 }
 
