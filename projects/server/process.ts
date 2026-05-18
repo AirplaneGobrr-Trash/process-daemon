@@ -3,6 +3,7 @@ import pidusage from "pidusage";
 import { Status, type ProcessOptions, type ProcessOptionsConfirmed, type Stat } from "../types.ts";
 import path from "path";
 import fs from "fs/promises";
+import { existsSync } from "fs";
 import { EventEmitter } from "events";
 
 export const logDir = path.join(process.cwd(), "logs");
@@ -16,6 +17,20 @@ async function checkExists(path: string) {
         // Does not exist
     }
     return false;
+}
+
+function resolveInterpreter(name: string): string | null {
+    const found = Bun.which(name);
+    if (found) return found;
+
+    const candidates = [
+        process.env.HOME ? `${process.env.HOME}/.bun/bin/${name}` : null,
+        `/usr/local/bin/${name}`,
+        `/usr/bin/${name}`,
+        `/opt/homebrew/bin/${name}`,
+    ].filter(Boolean) as string[];
+
+    return candidates.find(existsSync) ?? null;
 }
 
 function formatBytes(bytes: string | number, decimals = 2) {
@@ -54,8 +69,7 @@ export class Process extends EventEmitter {
         if (!info?.script?.trim()) info.script = ".";
         info.interpreter ||= "bun";
 
-        // @ts-ignore
-        this.info = info;
+        this.info = { ...info, script: info.script!, interpreter: info.interpreter! };
     }
 
     async getLogFile(path: string) {
@@ -89,9 +103,14 @@ export class Process extends EventEmitter {
         }
     }
 
-    async start() {
+    async start(isAutoRestart = false) {
         if (this.removed) return;
+        if (isAutoRestart && this._stopping) return;
         if (this.spawned && !this.spawned.exited) return;
+        if (!isAutoRestart) {
+            this.restartCount = 0;
+            this._stopping = false;
+        }
         const that = this;
 
         // TODO: restart lockout
@@ -99,10 +118,8 @@ export class Process extends EventEmitter {
 
         this.status = Status.Starting;
 
-        // Safety checks:
-
-        // Check if interpreter exists
-        if (!Bun.which(this.info.interpreter)) {
+        const interpreterPath = resolveInterpreter(this.info.interpreter);
+        if (!interpreterPath) {
             this.lastError = "No interpreter";
             this.status = Status.Error;
             return;
@@ -130,11 +147,8 @@ export class Process extends EventEmitter {
         const errWriter = outputErrLogFile.writer();
 
         const proc = Bun.spawn({
-            cmd: [this.info.interpreter, this.info.script],
-            env: {
-                ...process.env,
-                ...this.info.env
-            },
+            cmd: [interpreterPath, this.info.script],
+            env: { ...process.env, ...this.info.env },
             cwd: this.info.cwd,
             // stdout: outputLogFile,
             // stderr: outputErrLogFile,
@@ -155,12 +169,19 @@ export class Process extends EventEmitter {
                 if (that.info.restart && !that._stopping) {
                     that.spawned = undefined;
                     that.restartCount += 1;
-                    setTimeout(() => that.start(), 5 * 1000);
+                    const maxRestarts = that.info.maxRestarts ?? 5;
+                    if (that.restartCount >= maxRestarts) {
+                        that.status = Status.Error;
+                        that.lastError = `Exceeded max restarts (${maxRestarts})`;
+                        return;
+                    }
+                    setTimeout(() => that.start(true), 5 * 1000);
                 }
             },
         });
 
         this.status = Status.Online;
+        this.lastError = undefined;
         this.spawned = proc;
 
         (async () => {
@@ -187,11 +208,14 @@ export class Process extends EventEmitter {
 
     }
 
-    async getResourceUsage() {
-        if (!this.spawned) return;
-        const usage = await pidusage(this.spawned.pid);
-        this.monit = usage;
-        return usage;
+    async getResourceUsage(): Promise<Stat | undefined> {
+        if (!this.spawned || this.spawned.exitCode !== null) return;
+        try {
+            this.monit = await pidusage(this.spawned.pid) as Stat;
+        } catch {
+            // Process exited between the exitCode check and pidusage call
+        }
+        return this.monit;
     }
 
     async stop() {
@@ -201,8 +225,7 @@ export class Process extends EventEmitter {
 
         this._stopping = true;
         this.spawned?.kill();
-        await this.spawned?.exited
-        this._stopping = false;
+        await this.spawned?.exited;
 
         this.status = Status.Stopped;
     }

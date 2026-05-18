@@ -19,6 +19,7 @@ export interface ProcessOptions {
     script?: string;
     interpreter?: string;
     restart?: boolean;
+    maxRestarts?: number;
     env?: Record<string, string>;
 }
 
@@ -34,6 +35,7 @@ export interface ProcessInfo {
     name: string;
     monit?: Stat;
     lastAction?: Actions;
+    lastError?: string;
     status?: Status
 }
 

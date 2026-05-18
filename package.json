@@ -1,28 +1,38 @@
 {
-  "name": "@airplanegobrr/custom-pm2",
+  "name": "@airplanegobrr/process-daemon",
   "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./projects/client/index.ts",
-      "types": "./projects/types.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
     }
   },
   "scripts": {
     "server": "cd projects/server && bun server.ts",
-    "serverPM2": "cd projects/server && pm2 start --name \"Better PM2\" --interpreter ~/.bun/bin/bun server.ts",
+    "cli": "bun projects/cli/index.ts",
+    "build:sdk": "tsup",
+    "build:server": "bun run build.ts",
+    "build": "bun run build:sdk && bun run build:server",
     "link": "cd projects/client && bun link"
   },
   "devDependencies": {
-    "@types/bun": "^1.3.12"
+    "@types/bun": "^1.3.12",
+    "tsup": "^8.5.1"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
+    "@clack/prompts": "^1.4.0",
     "@types/express": "^5.0.6",
     "@types/pidusage": "^2.0.5",
     "axios": "^1.13.2",
     "bun.db": "^1.1.4",
+    "commander": "^14.0.3",
     "express": "^5.2.1",
     "pidusage": "^4.0.1"
   }

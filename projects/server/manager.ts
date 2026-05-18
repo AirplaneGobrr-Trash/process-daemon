@@ -31,6 +31,9 @@ function createProcess(project: ProcessOptions, projectID: number = getNextProce
         },
         get monit() {
             return proc.monit;
+        },
+        get lastError() {
+            return proc.lastError;
         }
     }
 
@@ -46,7 +49,12 @@ function createProcess(project: ProcessOptions, projectID: number = getNextProce
 }
 
 async function respawn() {
-    const projects = await saveFile.json() as ProcessInfo[];
+    let projects: ProcessInfo[] = [];
+    try {
+        projects = await saveFile.json() as ProcessInfo[];
+    } catch {
+        projects = [];
+    }
 
     for (let project of projects) {
         createProcess(project.startOptions, project.id);
@@ -68,10 +76,7 @@ function getProjects(getter: Getter): ProcessInfo[] {
         const proc = procs.find(v => v.id === id);
         if (proc) return [proc];
     }
-    // Fall back to name lookup
-    const byName = procs.find(v => v.name === getter);
-    if (byName) return [byName];
-    return [];
+    return procs.filter(v => v.name === getter);
 }
 
 async function doAction(getter: Getter, action: Actions) {
@@ -108,7 +113,7 @@ async function restart(getter: Getter) {
 
 async function remove(getter: Getter) {
     const projects = await doAction(getter, "remove");
-    for (let proc of projects) {
+    for (const proc of projects) {
         const idx = procs.findIndex(v => v.id === proc.id);
         if (idx !== -1) procs.splice(idx, 1);
     }

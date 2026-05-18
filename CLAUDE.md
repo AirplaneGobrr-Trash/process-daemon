@@ -1,0 +1,146 @@
+# process-daemon: Agent Context
+
+A minimal Bun-powered process manager built as a simpler alternative to PM2. The explicit goal is a codebase anyone can hold in their head. No plugin system, no cluster mode.
+
+## Writing style
+
+Never use em dashes (—) anywhere in this project. Use a regular hyphen (-), a colon, or restructure the sentence instead.
+
+## Naming
+
+- **`pdd`**: the daemon binary (`/usr/local/bin/pdd`). Runs as a systemd service.
+- **`pd`**: the CLI binary (`/usr/local/bin/pd`). Talks to the daemon over HTTP.
+- **`ProcClient`**: the TypeScript SDK class.
+- Package name: `@airplanegobrr/process-daemon`
+
+## Architecture
+
+Three components, all in `projects/`:
+
+```
+projects/
+  server/
+    server.ts     : Express HTTP server, defines all routes
+    manager.ts    : in-memory process list, persistence, actions
+    process.ts    : child process lifecycle (spawn, log, restart)
+  client/
+    index.ts      : ProcClient SDK (axios wrapper)
+  cli/
+    index.ts      : pd CLI (Commander, uses ProcClient)
+  types.ts        : shared types across all components
+```
+
+The server exposes an HTTP API on `:3830`. The client SDK and CLI both talk to it. The daemon is the only thing that directly manages processes.
+
+## HTTP API
+
+| Method | Route              | Description                        |
+|--------|--------------------|------------------------------------|
+| GET    | `/list`            | List all processes with monit data |
+| POST   | `/start`           | Start a new process (body: ProcessOptions) |
+| POST   | `/start/:getter`   | Start an existing stopped process  |
+| POST   | `/stop/:getter`    | Stop a process                     |
+| POST   | `/restart/:getter` | Restart a process                  |
+| POST   | `/remove/:getter`  | Stop and remove a process          |
+| GET    | `/logs/:getter`    | Returns `{ out: string, err: string }` |
+
+Mutations are POST. Always returns JSON.
+
+## Getter
+
+Most routes accept a `:getter` which can be:
+- A numeric process ID (`1`, `2`, ...)
+- A process name string (`"myapp"`)
+- `"all"`: applies to every process
+
+## Key types (`projects/types.ts`)
+
+```ts
+interface ProcessOptions {
+    name: string;
+    cwd: string;
+    script?: string;       // defaults to "." (runs the package)
+    interpreter?: string;  // defaults to "bun"
+    restart?: boolean;     // auto-restart on crash
+    maxRestarts?: number;  // default 5
+    env?: Record<string, string>;
+}
+
+interface ProcessInfo {
+    id: number;
+    name: string;
+    status: Status;        // "starting" | "online" | "stopping" | "stopped" | "error"
+    lastAction?: Actions;
+    lastError?: string;    // set on pre-flight failure or max restarts exceeded
+    monit?: Stat;          // cpu, memory, pid, elapsed - populated by list()
+}
+```
+
+## Important design decisions
+
+- **`process` on `ProcessInfo` is non-enumerable**: set via `Object.defineProperty` in `manager.ts` so it's excluded from `JSON.stringify` and never sent over the wire.
+- **`status` / `name` / `monit` / `lastError` are getters** on `ProcessInfo` that proxy to the `Process` instance. These are live values, not snapshots.
+- **Restart count resets on manual start**: `start(isAutoRestart = false)` resets `restartCount` to 0. Auto-restarts pass `true` so the count accumulates correctly.
+- **`lastError` clears on successful spawn**: set to `undefined` when `status` transitions to `Online`.
+- **Pre-flight checks set `Status.Error`**: missing interpreter/cwd/script sets error status immediately instead of getting stuck on `Starting`.
+- **Routes are explicit, not dynamic**: an earlier version auto-generated routes by iterating `proc` object keys; replaced with an explicit list to avoid accidentally exposing `save`/`respawn`.
+- **Processes.json is recovered gracefully**: `respawn()` wraps JSON parse in try/catch and defaults to `[]` on corrupt/empty file.
+- **CLI auto-starts the daemon**: every `pd` command calls `ensureDaemon()` first; on `ECONNREFUSED` it writes `/var/lib/pdd/env` with the current bun PATH, then runs `sudo systemctl start pdd` and polls until `:3830` responds.
+- **Interpreter is resolved to an absolute path**: `resolveInterpreter()` in `process.ts` tries `Bun.which` first, then falls back to known install locations (`~/.bun/bin`, `/usr/local/bin`, `/usr/bin`, `/opt/homebrew/bin`). The resolved path is passed directly to `Bun.spawn`, so systemd's stripped PATH never causes a "No interpreter" error.
+- **Bun PATH is written by the CLI, not hardcoded in the service**: `ensureDaemon()` writes `PATH=<bun-dir>:...` to `/var/lib/pdd/env` before starting the service. The service file uses `EnvironmentFile=-/var/lib/pdd/env` (the `-` means the file is optional, so cold starts without a prior `pd` invocation still work via `resolveInterpreter`'s fallback).
+- **`pd list` shows ERROR column only when needed**: the column is omitted when no process has a `lastError`, keeping normal output clean. When present, errors are shown in red.
+- **Ecosystem files are PM2-compatible**: `pd start` auto-detects `ecosystem.config.js`, `ecosystem.config.cjs`, `ecosystem.config.json`, or `ecosystem.json` in cwd. `--efile [path]` overrides the path. PM2 field names (`autorestart`, `max_restarts`) are normalized to the native ones on load. The save path (after interactive creation) always writes PM2-compatible JSON (`{ apps: [...] }`). JS/CJS files are loaded via dynamic `import()`.
+- **`_stopping` is never reset inside `stop()`**: it is only cleared at the top of a manual `start()` call (`isAutoRestart = false`). This prevents a race where `onExit` fires as a separate microtask after `await exited` resolves but before `_stopping` was (previously) reset to `false`, and also stops any pending `setTimeout` auto-restart from firing after a manual stop (`start(true)` returns immediately when `_stopping` is set).
+- **`getResourceUsage` guards against ESRCH**: checks `spawned.exitCode !== null` before calling `pidusage`, and wraps the call in try/catch to handle the narrow race where the process exits between the check and the pidusage call. Without this, `pd list` would 500 whenever any process was stopped.
+- **Interactive path prompts use readline tab completion**: `cwd`, `script`, and ecosystem file path prompts bypass `@clack/prompts` (which has no completer hook) and use a `readline.createInterface` with a custom `completer`. The script completer receives the entered `cwd` as `baseCwd` so it resolves relative paths against that directory for the filesystem read, but returns completions as relative paths so the user types `src/index.ts` not `/srv/api/src/index.ts`. The max-restarts validate uses `v && (...)` so pressing Enter on an empty input passes through to the `"5"` defaultValue rather than failing validation.
+
+## Intentionally excluded
+
+- No authentication (local daemon, trusted network assumed)
+- No log rotation (known gap: logs accumulate per-restart in `/var/lib/pdd/logs/`)
+
+## Data on disk
+
+- State: `/var/lib/pdd/processes.json`
+- Logs: `/var/lib/pdd/logs/<name>-<uuid>-<inc>.out.log` / `.err.log`
+- Each restart creates new log files (old ones are not cleaned up)
+
+## Build
+
+```bash
+bun run build        # builds SDK (tsup) + all binaries (bun compile)
+bun run build:sdk    # SDK only → dist/ (ESM + CJS + .d.ts)
+bun run build:server # all binaries → pdd-linux-{x64,arm64}, pd-linux-{x64,arm64}
+bun run server       # run daemon in dev (no compile)
+bun run cli -- <args> # run CLI in dev (no compile), e.g. bun run cli -- list
+```
+
+## CLI (`pd`)
+
+Built with Commander. Entry: `projects/cli/index.ts`.
+
+| Command | Description |
+|---------|-------------|
+| `pd list` / `pd ls` | Table of all processes with status, CPU, mem, uptime |
+| `pd start` | Interactive setup, or auto-detects an ecosystem file in cwd |
+| `pd start <name\|id>` | Start a stopped existing process |
+| `pd start --name foo --cwd /path [flags]` | Define and start a new process |
+| `pd start --efile [path]` | Start all processes from an ecosystem file |
+| `pd stop <getter>` | Stop (accepts name, id, or `all`) |
+| `pd restart <getter>` | Restart |
+| `pd remove <getter>` / `pd rm` | Remove |
+| `pd logs <getter> [--out\|--err]` | Show stdout and/or stderr |
+
+`pd start` flags: `--script`, `--interpreter`, `--restart`, `--max-restarts <n>`, `--env KEY=VALUE`, `--efile [path]`.
+
+## Installation
+
+```bash
+# From GitHub release
+curl -fsSL https://raw.githubusercontent.com/AirplaneGobrr-Trash/process-daemon/main/install.sh | bash
+
+# From local build (dev)
+bash install-local.sh
+```
+
+`install-local.sh` runs `bun run build:server`, installs the local binaries, and creates/restarts the systemd service.
