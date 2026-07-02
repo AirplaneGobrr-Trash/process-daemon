@@ -10,15 +10,16 @@ async function save() {
     await Bun.write(saveFile, JSON.stringify(procs));
 }
 
-function createProcess(project: ProcessOptions, projectID: number = getNextProcessNumber()): ProcessInfo & { process: Process } {
+function createProcess(project: ProcessOptions, projectID: number = getNextProcessNumber(), initialLogFiles: string[] = []): ProcessInfo & { process: Process } {
     const proc = new Process({
         cwd: project.cwd,
         name: project.name,
         interpreter: project.interpreter,
         env: project.env,
         script: project.script,
-        restart: project.restart
-    });
+        restart: project.restart,
+        maxRestarts: project.maxRestarts,
+    }, projectID, initialLogFiles);
 
     const procInfo: ProcessInfo = {
         startOptions: project,
@@ -34,7 +35,10 @@ function createProcess(project: ProcessOptions, projectID: number = getNextProce
         },
         get lastError() {
             return proc.lastError;
-        }
+        },
+        get logFiles() {
+            return proc.logFiles;
+        },
     }
 
     Object.defineProperty(procInfo, "process", {
@@ -57,7 +61,7 @@ async function respawn() {
     }
 
     for (let project of projects) {
-        createProcess(project.startOptions, project.id);
+        createProcess(project.startOptions, project.id, project.logFiles ?? []);
 
         if (project.lastAction) await doAction(project.id, project.lastAction);
     }

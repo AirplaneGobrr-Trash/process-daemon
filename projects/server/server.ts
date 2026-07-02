@@ -22,7 +22,8 @@ app.post("/start", async (req, res) => {
         script: body.script,
         interpreter: body.interpreter,
         env: body.env,
-        restart: body.restart
+        restart: body.restart,
+        maxRestarts: body.maxRestarts,
     });
     await proc.save();
     res.json(process);
@@ -46,9 +47,36 @@ app.get("/logs/:id", async (req, res) => {
     const id = req.params.id;
     const project = proc.getProjects(id)[0];
     if (!project) return res.status(404).json({ error: "No project found with that ID" });
-    const logs = await project.process?.readLogFiles();
-    if (!logs) return res.status(404).json({ error: "No logs / Process not running" });
+    const runsParam = req.query.runs;
+    const runs = runsParam !== undefined ? Number(runsParam) : undefined;
+    const logs = await project.process?.readLogFiles(runs);
+    if (!logs) return res.status(404).json({ error: "No logs found" });
     res.json(logs);
+});
+
+app.get("/logs/:getter/stream", (req, res) => {
+    const projects = proc.getProjects(req.params.getter);
+    if (projects.length === 0) return res.status(404).json({ error: "No project found with that getter" });
+
+    res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+    });
+
+    const listeners = projects.map(p => {
+        const listener = (msg: { type: "out" | "err"; line: string }) => {
+            res.write(`data: ${JSON.stringify({ id: p.id, ...msg })}\n\n`);
+        };
+        p.process?.on("out", listener);
+        return { process: p.process, listener };
+    });
+
+    req.on("close", () => {
+        for (const { process, listener } of listeners) {
+            process?.off("out", listener);
+        }
+    });
 });
 
 app.listen("3830", () => {

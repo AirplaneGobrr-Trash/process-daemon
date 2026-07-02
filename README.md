@@ -69,7 +69,7 @@ await pd.start({ name: "api", cwd: "/home/user/api", script: "index.ts", restart
 | `pd stop <getter>` | Stop (accepts name, id, or `all`) |
 | `pd restart <getter>` | Restart |
 | `pd remove <getter>` / `pd rm` | Remove |
-| `pd logs <getter> [--out\|--err]` | Show stdout and/or stderr |
+| `pd logs <getter> [--out\|--err] [--runs N] [-f]` | Show stdout and/or stderr (last 3 runs by default); `-f` streams new lines live until Ctrl+C |
 
 `pd start` flags: `--script`, `--interpreter`, `--restart`, `--max-restarts <n>`, `--env KEY=VALUE`, `--efile [path]`.
 

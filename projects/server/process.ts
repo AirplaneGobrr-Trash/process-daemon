@@ -3,15 +3,15 @@ import pidusage from "pidusage";
 import { Status, type ProcessOptions, type ProcessOptionsConfirmed, type Stat } from "../types.ts";
 import path from "path";
 import fs from "fs/promises";
-import { existsSync } from "fs";
+import { existsSync, createWriteStream } from "fs";
 import { EventEmitter } from "events";
 
 export const logDir = path.join(process.cwd(), "logs");
 await fs.mkdir(logDir, { recursive: true });
 
-async function checkExists(path: string) {
+async function checkExists(p: string) {
     try {
-        await fs.access(path);
+        await fs.access(p);
         return true;
     } catch {
         // Does not exist
@@ -33,73 +33,68 @@ function resolveInterpreter(name: string): string | null {
     return candidates.find(existsSync) ?? null;
 }
 
-function formatBytes(bytes: string | number, decimals = 2) {
-    bytes = Number(bytes);
-    if (!+bytes) return '0 Bytes'
-
-    const k = 1024
-    const dm = decimals < 0 ? 0 : decimals
-    const sizes = ['Bytes', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB']
-
-    const i = Math.floor(Math.log(bytes) / Math.log(k))
-
-    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`
-}
-
 export class Process extends EventEmitter {
     public info: ProcessOptionsConfirmed;
+    public id: number;
     private spawned?: Bun.Subprocess;
 
     public lastExit?: number;
     public lastCode?: number | null;
     public lastError?: string;
-    public fileName?: string;
-    public fileInc: number = 0;
+
+    // All log file base names for this process, oldest first.
+    // Each entry maps to <base>.out.log and <base>.err.log in logDir.
+    public logFiles: string[];
+    private fileInc: number;
 
     public removed: boolean = false;
     public status: Status = Status.Stopped;
     public restartCount: number = 0;
 
     private _stopping = false;
+    private stableTimer?: ReturnType<typeof setTimeout>;
 
     public monit?: Stat;
 
-    constructor(info: ProcessOptions) {
+    constructor(info: ProcessOptions, id: number, initialLogFiles: string[] = []) {
         super();
+        this.id = id;
+        this.logFiles = [...initialLogFiles];
+        // fileInc ensures unique filenames even after old entries are pruned from logFiles
+        this.fileInc = initialLogFiles.length;
         if (!info?.script?.trim()) info.script = ".";
         info.interpreter ||= "bun";
-
         this.info = { ...info, script: info.script!, interpreter: info.interpreter! };
     }
 
-    async getLogFile(path: string) {
-        const file = Bun.file(path);
-        if (!await file.exists()) await Bun.write(file, "");
-        return file
+    private newLogBase(): string {
+        const base = `${this.info.name.replaceAll("/", "_")}-${Bun.randomUUIDv7().split("-").pop()}-${this.fileInc++}`;
+        this.logFiles.push(base);
+        return base;
     }
 
-    async getLogFiles(newFile: boolean = false) {
-        const newF = newFile || !this.fileName
-        // If we are making a new file or no file name
-        if (newF) this.fileName = `${this.info.name.replaceAll("/", "_")}-${Bun.randomUUIDv7().split("-").pop()}-${this.fileInc++}`
-
-        // We should really cache the results below??
-        const outputLogFile = await this.getLogFile(path.join(logDir, `${this.fileName}.out.log`));
-        const outputErrLogFile = await this.getLogFile(path.join(logDir, `${this.fileName}.err.log`));
-
-        return {
-            outputLogFile,
-            outputErrLogFile
+    // Returns combined stdout/stderr content across the last `runs` runs (all runs if omitted).
+    // Each run's content is bracketed by start/end marker lines written at spawn time.
+    async readLogFiles(runs?: number): Promise<{ out: string; err: string }> {
+        if (this.logFiles.length === 0) return { out: "", err: "" };
+        const toRead = runs !== undefined ? this.logFiles.slice(-runs) : this.logFiles;
+        let out = "", err = "";
+        for (const base of toRead) {
+            const outFile = Bun.file(path.join(logDir, `${base}.out.log`));
+            const errFile = Bun.file(path.join(logDir, `${base}.err.log`));
+            if (await outFile.exists()) out += await outFile.text();
+            if (await errFile.exists()) err += await errFile.text();
         }
+        return { out, err };
     }
 
-    async readLogFiles() {
-        if (!this.fileName) return { out: "", err: "" };
-
-        const { outputLogFile, outputErrLogFile } = await this.getLogFiles();
-        return {
-            out: await outputLogFile.text(),
-            err: await outputErrLogFile.text()
+    // Deletes log file pairs for all runs beyond the most recent `keep`.
+    async cleanOldLogs(keep = 10): Promise<void> {
+        if (this.logFiles.length <= keep) return;
+        const toDelete = this.logFiles.splice(0, this.logFiles.length - keep);
+        for (const base of toDelete) {
+            await fs.unlink(path.join(logDir, `${base}.out.log`)).catch(() => {});
+            await fs.unlink(path.join(logDir, `${base}.err.log`)).catch(() => {});
         }
     }
 
@@ -113,9 +108,6 @@ export class Process extends EventEmitter {
         }
         const that = this;
 
-        // TODO: restart lockout
-        // Not sure how to do that lols!
-
         this.status = Status.Starting;
 
         const interpreterPath = resolveInterpreter(this.info.interpreter);
@@ -125,14 +117,12 @@ export class Process extends EventEmitter {
             return;
         }
 
-        // Check if CWD exists
         if (!await checkExists(this.info.cwd)) {
             this.lastError = "No CWD Exists";
             this.status = Status.Error;
             return;
         }
 
-        // Check if script exists
         if (this.info.script != ".") {
             const scriptPath = path.join(this.info.cwd, this.info.script);
             if (!await Bun.file(scriptPath).exists()) {
@@ -142,21 +132,27 @@ export class Process extends EventEmitter {
             }
         }
 
-        const { outputLogFile, outputErrLogFile } = await this.getLogFiles(true);
-        const outWriter = outputLogFile.writer();
-        const errWriter = outputErrLogFile.writer();
+        const base = this.newLogBase();
+        const outPath = path.join(logDir, `${base}.out.log`);
+        const errPath = path.join(logDir, `${base}.err.log`);
+
+        const startTs = new Date().toISOString();
+        const startMarker = `-- Process (${this.id}) started at ${startTs} --\n`;
+        await fs.writeFile(outPath, startMarker);
+        await fs.writeFile(errPath, startMarker);
+
+        const outStream = createWriteStream(outPath, { flags: "a" });
+        const errStream = createWriteStream(errPath, { flags: "a" });
 
         const proc = Bun.spawn({
             cmd: [interpreterPath, this.info.script],
             env: { ...process.env, ...this.info.env },
             cwd: this.info.cwd,
-            // stdout: outputLogFile,
-            // stderr: outputErrLogFile,
-
             stdout: "pipe",
             stderr: "pipe",
 
-            onExit(subprocess, exitCode, signalCode, error) {
+            onExit(_subprocess, exitCode, _signalCode, error) {
+                if (that.stableTimer) clearTimeout(that.stableTimer);
                 that.lastExit = new Date().valueOf();
                 that.lastCode = exitCode;
 
@@ -184,28 +180,48 @@ export class Process extends EventEmitter {
         this.lastError = undefined;
         this.spawned = proc;
 
-        (async () => {
+        // Consider the restart storm over once the process has stayed up for a while,
+        // so a crash long after a healthy run doesn't inherit the old restart count.
+        this.stableTimer = setTimeout(() => {
+            that.restartCount = 0;
+        }, 30 * 1000);
+
+        const outDone = (async () => {
             for await (const chunk of proc.stdout) {
-                outWriter.write(chunk);
+                outStream.write(chunk);
                 that.emit("out", {
                     type: "out",
                     line: new TextDecoder().decode(chunk)
                 });
             }
-            await outWriter.end();
         })();
 
-        (async () => {
+        const errDone = (async () => {
             for await (const chunk of proc.stderr) {
-                errWriter.write(chunk);
+                errStream.write(chunk);
                 that.emit("out", {
                     type: "err",
                     line: new TextDecoder().decode(chunk)
                 });
             }
-            await errWriter.end();
         })();
 
+        // After the process exits and both streams are fully drained, write the end marker
+        // and clean up old log files beyond the retention limit.
+        Promise.all([outDone, errDone]).then(async () => {
+            const ts = new Date().toISOString();
+            const code = that.lastCode;
+            let verb: string;
+            if (that._stopping) verb = "stopped";
+            else if (code === 0) verb = "exited";
+            else verb = `errored (code ${code ?? "unknown"})`;
+
+            const endMarker = `-- Process (${that.id}) ${verb} at ${ts} --\n`;
+            await new Promise<void>(r => outStream.write(endMarker, () => outStream.end(r)));
+            await new Promise<void>(r => errStream.write(endMarker, () => errStream.end(r)));
+
+            await that.cleanOldLogs();
+        });
     }
 
     async getResourceUsage(): Promise<Stat | undefined> {
@@ -241,9 +257,7 @@ export class Process extends EventEmitter {
     async remove() {
         if (this.removed) return;
         await this.stop();
-        // Clear properties
         this.spawned = undefined;
         this.removed = true;
     }
-
 }

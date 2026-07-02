@@ -1,5 +1,5 @@
 import axios, { type AxiosInstance } from "axios";
-import type { Getter, ProcessInfo, ProcessOptions } from "../types";
+import type { Getter, LogStreamMessage, ProcessInfo, ProcessOptions } from "../types";
 export * from "../types";
 
 export class ProcClient {
@@ -50,7 +50,43 @@ export class ProcClient {
         return this.post("/start", config);
     }
 
-    async logs(getter: Getter): Promise<{ out: string, err: string }> {
-        return this.get(`/logs/${getter}`);
+    async logs(getter: Getter, options?: { runs?: number }): Promise<{ out: string, err: string }> {
+        const qs = options?.runs !== undefined ? `?runs=${options.runs}` : "";
+        return this.get(`/logs/${getter}${qs}`);
+    }
+
+    // Streams live stdout/stderr as it's produced, until the process exits, the
+    // server closes the connection, or `signal` is aborted. Resolves once streaming ends.
+    async streamLogs(getter: Getter, onMessage: (msg: LogStreamMessage) => void, signal?: AbortSignal): Promise<void> {
+        const res = await this.http.get(`/logs/${getter}/stream`, {
+            responseType: "stream",
+            timeout: 0,
+            signal,
+        });
+
+        const stream = res.data as NodeJS.ReadableStream;
+
+        if (res.status >= 400) {
+            const chunks: Buffer[] = [];
+            for await (const chunk of stream) chunks.push(chunk as Buffer);
+            throw new Error(`${res.status}: ${Buffer.concat(chunks).toString()}`);
+        }
+
+        let buffer = "";
+        for await (const chunk of stream) {
+            buffer += chunk.toString();
+            let idx: number;
+            while ((idx = buffer.indexOf("\n\n")) !== -1) {
+                const raw = buffer.slice(0, idx);
+                buffer = buffer.slice(idx + 2);
+                const dataLine = raw.split("\n").find(l => l.startsWith("data: "));
+                if (!dataLine) continue;
+                try {
+                    onMessage(JSON.parse(dataLine.slice("data: ".length)) as LogStreamMessage);
+                } catch {
+                    // Ignore malformed frames
+                }
+            }
+        }
     }
 }

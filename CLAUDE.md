@@ -42,7 +42,8 @@ The server exposes an HTTP API on `:3830`. The client SDK and CLI both talk to i
 | POST   | `/stop/:getter`    | Stop a process                     |
 | POST   | `/restart/:getter` | Restart a process                  |
 | POST   | `/remove/:getter`  | Stop and remove a process          |
-| GET    | `/logs/:getter`    | Returns `{ out: string, err: string }` |
+| GET    | `/logs/:getter`    | Returns `{ out: string, err: string }`. Optional `?runs=N` limits to the last N runs. |
+| GET    | `/logs/:getter/stream` | Server-Sent Events stream of live stdout/stderr lines as they're produced, as `{ id, type: "out" \| "err", line }` frames. Matches every process the getter resolves to (including `"all"`). |
 
 Mutations are POST. Always returns JSON.
 
@@ -73,14 +74,16 @@ interface ProcessInfo {
     lastAction?: Actions;
     lastError?: string;    // set on pre-flight failure or max restarts exceeded
     monit?: Stat;          // cpu, memory, pid, elapsed - populated by list()
+    logFiles?: string[];   // base names of all log file pairs, persisted across daemon restarts
 }
 ```
 
 ## Important design decisions
 
 - **`process` on `ProcessInfo` is non-enumerable**: set via `Object.defineProperty` in `manager.ts` so it's excluded from `JSON.stringify` and never sent over the wire.
-- **`status` / `name` / `monit` / `lastError` are getters** on `ProcessInfo` that proxy to the `Process` instance. These are live values, not snapshots.
+- **`status` / `name` / `monit` / `lastError` / `logFiles` are getters** on `ProcessInfo` that proxy to the `Process` instance. These are live values, not snapshots.
 - **Restart count resets on manual start**: `start(isAutoRestart = false)` resets `restartCount` to 0. Auto-restarts pass `true` so the count accumulates correctly.
+- **Restart count also resets after 30s of stable uptime**: each successful spawn starts a `stableTimer` that zeroes `restartCount` after 30 seconds if the process is still running. `onExit` clears the timer first, so a crash (manual stop, auto-restart, or otherwise) before the 30s mark never lets a stale timer reset the count out from under a fresh restart storm. This is what lets `maxRestarts` mean "N crashes in a row" instead of "N crashes ever".
 - **`lastError` clears on successful spawn**: set to `undefined` when `status` transitions to `Online`.
 - **Pre-flight checks set `Status.Error`**: missing interpreter/cwd/script sets error status immediately instead of getting stuck on `Starting`.
 - **Routes are explicit, not dynamic**: an earlier version auto-generated routes by iterating `proc` object keys; replaced with an explicit list to avoid accidentally exposing `save`/`respawn`.
@@ -93,17 +96,52 @@ interface ProcessInfo {
 - **`_stopping` is never reset inside `stop()`**: it is only cleared at the top of a manual `start()` call (`isAutoRestart = false`). This prevents a race where `onExit` fires as a separate microtask after `await exited` resolves but before `_stopping` was (previously) reset to `false`, and also stops any pending `setTimeout` auto-restart from firing after a manual stop (`start(true)` returns immediately when `_stopping` is set).
 - **`getResourceUsage` guards against ESRCH**: checks `spawned.exitCode !== null` before calling `pidusage`, and wraps the call in try/catch to handle the narrow race where the process exits between the check and the pidusage call. Without this, `pd list` would 500 whenever any process was stopped.
 - **Interactive path prompts use readline tab completion**: `cwd`, `script`, and ecosystem file path prompts bypass `@clack/prompts` (which has no completer hook) and use a `readline.createInterface` with a custom `completer`. The script completer receives the entered `cwd` as `baseCwd` so it resolves relative paths against that directory for the filesystem read, but returns completions as relative paths so the user types `src/index.ts` not `/srv/api/src/index.ts`. The max-restarts validate uses `v && (...)` so pressing Enter on an empty input passes through to the `"5"` defaultValue rather than failing validation.
+- **Live logs use Server-Sent Events, not WebSockets**: `Process` already emits an `"out"` event (`{ type: "out" | "err", line }`) for every chunk written to its log files. `GET /logs/:getter/stream` subscribes to that event on every matched process and writes `data: {...}\n\n` frames; the listener is removed on `req.on("close")` so a disconnected client doesn't leak listeners on a long-lived `Process`. The client SDK's `streamLogs()` reads the response as a raw Node stream (`responseType: "stream"`, `timeout: 0` to override the instance's 5s default) and splits on `\n\n` itself rather than pulling in an SSE/EventSource dependency. `pd logs <getter> -f` prints history first, then calls `streamLogs()` until Ctrl+C aborts the request.
+
+## Log file behavior
+
+Each process run (start/restart) gets its own pair of log files: `<name>-<uuid>-<inc>.out.log` and `.err.log`. Both files begin with a start marker and end with a stop/exit/error marker:
+
+```
+-- Process (1) started at 2025-01-01T00:00:00.000Z --
+<stdout or stderr output>
+-- Process (1) stopped at 2025-01-01T00:01:00.000Z --
+```
+
+End verb is `stopped` (manual stop), `exited` (clean exit, code 0), or `errored (code N)` (non-zero exit).
+
+The daemon keeps the last 10 log file pairs per process and deletes older ones automatically after each run ends. `logFiles` (the list of base names) is a getter on `ProcessInfo` and is serialized into `processes.json`, so log history survives daemon restarts.
+
+`GET /logs/:getter?runs=N` returns the last N runs concatenated. `pd logs <getter>` defaults to the last 3 runs; use `--runs N` to override.
+
+## ENV variables
+
+Pass `env` in `ProcessOptions` to inject environment variables into the spawned process. The daemon merges the system environment with the provided values, with user values taking priority:
+
+```ts
+const client = new ProcClient();
+await client.start({
+    name: "my-app",
+    cwd: "/path/to/app",
+    env: {
+        NODE_ENV: "production",
+        PORT: "8080",
+        DATABASE_URL: "postgres://localhost/mydb",
+    },
+});
+```
+
+From the CLI: `pd start --name my-app --cwd /path/to/app --env NODE_ENV=production PORT=8080`.
 
 ## Intentionally excluded
 
 - No authentication (local daemon, trusted network assumed)
-- No log rotation (known gap: logs accumulate per-restart in `/var/lib/pdd/logs/`)
 
 ## Data on disk
 
 - State: `/var/lib/pdd/processes.json`
 - Logs: `/var/lib/pdd/logs/<name>-<uuid>-<inc>.out.log` / `.err.log`
-- Each restart creates new log files (old ones are not cleaned up)
+- Only the last 10 log file pairs per process are kept; older ones are deleted after each run.
 
 ## Build
 
@@ -129,7 +167,7 @@ Built with Commander. Entry: `projects/cli/index.ts`.
 | `pd stop <getter>` | Stop (accepts name, id, or `all`) |
 | `pd restart <getter>` | Restart |
 | `pd remove <getter>` / `pd rm` | Remove |
-| `pd logs <getter> [--out\|--err]` | Show stdout and/or stderr |
+| `pd logs <getter> [--out\|--err] [--runs N]` | Show stdout and/or stderr (last 3 runs by default) |
 
 `pd start` flags: `--script`, `--interpreter`, `--restart`, `--max-restarts <n>`, `--env KEY=VALUE`, `--efile [path]`.
 

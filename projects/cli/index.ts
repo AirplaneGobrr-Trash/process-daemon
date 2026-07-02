@@ -470,9 +470,12 @@ program
     .description("Show logs for a process")
     .option("--out", "Show stdout only")
     .option("--err", "Show stderr only")
+    .option("--runs <n>", "Number of past runs to show (default: 3)", Number)
+    .option("-f, --follow", "Stream live logs after showing history, until Ctrl+C")
     .action(async (getter: string, opts) => {
         await ensureDaemon();
-        const { out, err } = await client.logs(getter);
+        const runs: number = opts.runs ?? 3;
+        const { out, err } = await client.logs(getter, { runs });
 
         const showOut = !opts.err;
         const showErr = !opts.out;
@@ -485,6 +488,22 @@ program
             if (showOut) process.stderr.write(process.stdout.isTTY ? COLOR.dim("── stderr ──\n") : "── stderr ──\n");
             process.stderr.write(err.endsWith("\n") ? err : err + "\n");
         }
+
+        if (!opts.follow) return;
+
+        process.stdout.write(process.stdout.isTTY ? COLOR.dim("── streaming live logs (Ctrl+C to exit) ──\n") : "── streaming live logs (Ctrl+C to exit) ──\n");
+        const controller = new AbortController();
+        process.on("SIGINT", () => {
+            controller.abort();
+            process.exit(0);
+        });
+        await client.streamLogs(getter, msg => {
+            if (msg.type === "out" && showOut) process.stdout.write(msg.line);
+            if (msg.type === "err" && showErr) process.stderr.write(msg.line);
+        }, controller.signal).catch(e => {
+            if (isAxiosError(e) && e.code === "ERR_CANCELED") return;
+            throw e;
+        });
     });
 
 program.parseAsync(process.argv);

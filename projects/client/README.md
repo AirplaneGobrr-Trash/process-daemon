@@ -91,6 +91,19 @@ await pd.remove("all");
 
 ```ts
 const { out, err } = await pd.logs("myapp");
+const { out, err } = await pd.logs("myapp", { runs: 1 }); // last run only
+```
+
+### `pd.streamLogs(getter, onMessage, signal?)` - live stdout/stderr
+
+Resolves once the connection ends (process removed, server closes it, or `signal` is aborted). Matches every process the getter resolves to, including `"all"`.
+
+```ts
+const controller = new AbortController();
+
+await pd.streamLogs("myapp", (msg) => {
+    console.log(`[${msg.id}] ${msg.type}: ${msg.line}`);
+}, controller.signal);
 ```
 
 ---

@@ -16,7 +16,9 @@ export enum Status {
 export interface ProcessOptions {
     name: string;
     cwd: string;
+    // Defaults to "." TODO: Don't do that unless using bun/node
     script?: string;
+    // Defaults to bun
     interpreter?: string;
     restart?: boolean;
     maxRestarts?: number;
@@ -36,7 +38,14 @@ export interface ProcessInfo {
     monit?: Stat;
     lastAction?: Actions;
     lastError?: string;
-    status?: Status
+    status?: Status;
+    logFiles?: string[];
+}
+
+export interface LogStreamMessage {
+    id: number;
+    type: "out" | "err";
+    line: string;
 }
 
 export interface Monit {
