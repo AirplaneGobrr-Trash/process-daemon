@@ -19,10 +19,12 @@ esac
 BASE_URL="https://github.com/$GITHUB_USER/$REPO/releases/latest/download"
 
 echo "Downloading pdd..."
-curl -fsSL "$BASE_URL/pdd-linux-$ARCH" -o /tmp/pdd-download
+curl -fsSL "$BASE_URL/pdd-linux-$ARCH.gz" -o /tmp/pdd-download.gz
+gunzip -f /tmp/pdd-download.gz
 
 echo "Downloading pd..."
-curl -fsSL "$BASE_URL/pd-linux-$ARCH" -o /tmp/pd-download
+curl -fsSL "$BASE_URL/pd-linux-$ARCH.gz" -o /tmp/pd-download.gz
+gunzip -f /tmp/pd-download.gz
 
 echo "Installing binaries..."
 sudo install -m 755 /tmp/pdd-download "$PDD_BINARY"

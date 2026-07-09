@@ -13,4 +13,14 @@ for (const { target, arch } of targets) {
     process.stdout.write(`Building pd-linux-${arch}... `);
     await $`bun build --compile --target=${target} ./projects/cli/index.ts --outfile ./pd-linux-${arch}`.quiet();
     console.log("done");
+
+    process.stdout.write(`Compressing pdd-linux-${arch}... `);
+    await $`gzip -9 -f -k ./pdd-linux-${arch}`.quiet();
+    console.log("done");
+
+    process.stdout.write(`Compressing pd-linux-${arch}... `);
+    await $`gzip -9 -f -k ./pd-linux-${arch}`.quiet();
+    console.log("done");
 }
+
+console.log("\nUpload the .gz files to the GitHub release, not the raw binaries.");

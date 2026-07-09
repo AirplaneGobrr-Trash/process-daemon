@@ -107,10 +107,11 @@ function resolveArch(): "x64" | "arm64" {
 }
 
 async function downloadAsset(name: string, destPath: string): Promise<void> {
-    const url = `https://github.com/${GITHUB_REPO}/releases/latest/download/${name}`;
+    const url = `https://github.com/${GITHUB_REPO}/releases/latest/download/${name}.gz`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`failed to download ${name}: ${res.status}`);
-    await Bun.write(destPath, res);
+    const gz = new Uint8Array(await res.arrayBuffer());
+    await Bun.write(destPath, Bun.gunzipSync(gz));
 }
 
 // Downloads the latest pd/pdd binaries, installs them over the current ones via sudo,
