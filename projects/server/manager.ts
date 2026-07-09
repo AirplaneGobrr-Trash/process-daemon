@@ -1,4 +1,4 @@
-import type { ProcessOptions, ProcessInfo, Getter, Actions } from "../types";
+import type { ProcessOptions, ProcessInfo, Getter, Actions, ActionResult } from "../types";
 import { Process } from "./process";
 
 const procs: ProcessInfo[] = [];
@@ -94,34 +94,38 @@ async function doAction(getter: Getter, action: Actions) {
     return projects;
 }
 
-async function start(options: Getter | ProcessOptions) {
+async function start(options: Getter | ProcessOptions): Promise<ActionResult> {
     if (typeof options === "number" || typeof options === "string") {
         // Custom logic
-        return await doAction(options, "start");
+        const projects = await doAction(options, "start");
+        return { affected: projects.map(p => p.id), processes: await list() };
     }
 
     const procInfo = createProcess(options);
 
     await procInfo.process.start();
     procInfo.lastAction = "start";
-    return [procInfo];
+    return { affected: [procInfo.id], processes: await list() };
 }
 
-async function stop(getter: Getter) {
-    return await doAction(getter, "stop")
+async function stop(getter: Getter): Promise<ActionResult> {
+    const projects = await doAction(getter, "stop");
+    return { affected: projects.map(p => p.id), processes: await list() };
 }
 
-async function restart(getter: Getter) {
-    return await doAction(getter, "restart")
+async function restart(getter: Getter): Promise<ActionResult> {
+    const projects = await doAction(getter, "restart");
+    return { affected: projects.map(p => p.id), processes: await list() };
 }
 
-async function remove(getter: Getter) {
+async function remove(getter: Getter): Promise<ActionResult> {
     const projects = await doAction(getter, "remove");
+    const affected = projects.map(p => p.id);
     for (const proc of projects) {
         const idx = procs.findIndex(v => v.id === proc.id);
         if (idx !== -1) procs.splice(idx, 1);
     }
-    return projects;
+    return { affected, processes: await list() };
 }
 
 async function list() {

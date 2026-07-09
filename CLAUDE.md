@@ -27,6 +27,7 @@ projects/
     index.ts      : ProcClient SDK (axios wrapper)
   cli/
     index.ts      : pd CLI (Commander, uses ProcClient)
+    update.ts     : version comparison, cached update-check, self-update install
   types.ts        : shared types across all components
 ```
 
@@ -37,11 +38,11 @@ The server exposes an HTTP API on `:3830`. The client SDK and CLI both talk to i
 | Method | Route              | Description                        |
 |--------|--------------------|------------------------------------|
 | GET    | `/list`            | List all processes with monit data |
-| POST   | `/start`           | Start a new process (body: ProcessOptions) |
-| POST   | `/start/:getter`   | Start an existing stopped process  |
-| POST   | `/stop/:getter`    | Stop a process                     |
-| POST   | `/restart/:getter` | Restart a process                  |
-| POST   | `/remove/:getter`  | Stop and remove a process          |
+| POST   | `/start`           | Start a new process (body: ProcessOptions), returns `ActionResult` |
+| POST   | `/start/:getter`   | Start an existing stopped process, returns `ActionResult` |
+| POST   | `/stop/:getter`    | Stop a process, returns `ActionResult`     |
+| POST   | `/restart/:getter` | Restart a process, returns `ActionResult`  |
+| POST   | `/remove/:getter`  | Stop and remove a process, returns `ActionResult` |
 | GET    | `/logs/:getter`    | Returns `{ out: string, err: string }`. Optional `?runs=N` limits to the last N runs. |
 | GET    | `/logs/:getter/stream` | Server-Sent Events stream of live stdout/stderr lines as they're produced, as `{ id, type: "out" \| "err", line }` frames. Matches every process the getter resolves to (including `"all"`). |
 
@@ -76,6 +77,11 @@ interface ProcessInfo {
     monit?: Stat;          // cpu, memory, pid, elapsed - populated by list()
     logFiles?: string[];   // base names of all log file pairs, persisted across daemon restarts
 }
+
+interface ActionResult {
+    affected: number[];        // ids the action actually applied to
+    processes: ProcessInfo[];  // full process list, refreshed (monit included) after the action ran
+}
 ```
 
 ## Important design decisions
@@ -97,6 +103,11 @@ interface ProcessInfo {
 - **`getResourceUsage` guards against ESRCH**: checks `spawned.exitCode !== null` before calling `pidusage`, and wraps the call in try/catch to handle the narrow race where the process exits between the check and the pidusage call. Without this, `pd list` would 500 whenever any process was stopped.
 - **Interactive path prompts use readline tab completion**: `cwd`, `script`, and ecosystem file path prompts bypass `@clack/prompts` (which has no completer hook) and use a `readline.createInterface` with a custom `completer`. The script completer receives the entered `cwd` as `baseCwd` so it resolves relative paths against that directory for the filesystem read, but returns completions as relative paths so the user types `src/index.ts` not `/srv/api/src/index.ts`. The max-restarts validate uses `v && (...)` so pressing Enter on an empty input passes through to the `"5"` defaultValue rather than failing validation.
 - **Live logs use Server-Sent Events, not WebSockets**: `Process` already emits an `"out"` event (`{ type: "out" | "err", line }`) for every chunk written to its log files. `GET /logs/:getter/stream` subscribes to that event on every matched process and writes `data: {...}\n\n` frames; the listener is removed on `req.on("close")` so a disconnected client doesn't leak listeners on a long-lived `Process`. The client SDK's `streamLogs()` reads the response as a raw Node stream (`responseType: "stream"`, `timeout: 0` to override the instance's 5s default) and splits on `\n\n` itself rather than pulling in an SSE/EventSource dependency. `pd logs <getter> -f` prints history first, then calls `streamLogs()` until Ctrl+C aborts the request.
+- **Managed processes are spawned detached and stopped via process-group kill**: `Bun.spawn` is called with `detached: true`, making the child a session/process-group leader (`setsid`). `stop()` signals the whole group with `process.kill(-spawned.pid, "SIGTERM")` instead of `spawned.kill()`. Without this, a managed command that's itself a wrapper (`npm start`, a shell script, `next start`) would only have its wrapper process killed; any real server it forked internally would be reparented to init and keep running (and keep serving traffic) while `pd ls` reported the process as stopped.
+- **Action endpoints return the full process list, not just the affected ones**: `start`/`stop`/`restart`/`remove` in `manager.ts` return `{ affected, processes }` where `processes` is a freshly `list()`-ed snapshot (monit included) of every process, and `affected` is the ids the getter actually matched. Previously these returned only the matched `ProcessInfo[]` with stale `monit` (since only `list()` calls `getResourceUsage()`), so `pd restart 1` showed just process 1 with its old PID/CPU/mem instead of the new ones. The CLI renders the full table with a `→` marker on affected rows (`printTable(processes, highlight)` in `cli/index.ts`) instead of a single-row table.
+- **Update checks are cached and never block a command**: `cli/update.ts` reads/writes `~/.cache/pd/update-check.json` (`{ checkedAt, latestVersion, releaseUrl }`). A `preAction` Commander hook fires `refreshUpdateCacheIfStale()` without awaiting it (skipped for `update` itself), which only hits the GitHub releases API if the cache is missing or older than 24h, with a 2s abort timeout. A `postAction` hook then prints the nag banner from whatever is cached (no network call), so the banner is always instant and reflects the previous command's background refresh rather than the current one.
+- **The package version is the single source of truth**: `package.json`'s `version` field is imported directly into `cli/update.ts` (bundled at compile time, since `bun build --compile` inlines JSON imports) and used both for `pd --version` and for the update-available comparison. Release tags on GitHub aren't strict semver (`dev-1.0.1`); `compareVersions()` strips any non-digit prefix before comparing dotted numeric parts.
+- **`pd update` re-runs the install.sh binary-swap logic in-process**: fetches the latest release (with its changelog body, printed before the confirm prompt), downloads `pd-linux-$ARCH`/`pdd-linux-$ARCH` from the `releases/latest/download/` alias, `sudo install`s them over `/usr/local/bin/{pd,pdd}`, then `sudo systemctl restart pdd`. Requires confirmation unless `-y/--yes` is passed, since it overwrites system binaries and restarts a service.
 
 ## Log file behavior
 
@@ -168,8 +179,11 @@ Built with Commander. Entry: `projects/cli/index.ts`.
 | `pd restart <getter>` | Restart |
 | `pd remove <getter>` / `pd rm` | Remove |
 | `pd logs <getter> [--out\|--err] [--runs N]` | Show stdout and/or stderr (last 3 runs by default) |
+| `pd update [-y\|--yes]` | Update `pd`/`pdd` to the latest GitHub release |
 
 `pd start` flags: `--script`, `--interpreter`, `--restart`, `--max-restarts <n>`, `--env KEY=VALUE`, `--efile [path]`.
+
+Every command checks a 24h-cached local file for a newer release and, if one exists, prints a nag banner after its output pointing at `pd update`. See "Update checks are cached..." above.
 
 ## Installation
 

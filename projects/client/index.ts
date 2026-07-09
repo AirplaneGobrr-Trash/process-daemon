@@ -1,5 +1,5 @@
 import axios, { type AxiosInstance } from "axios";
-import type { Getter, LogStreamMessage, ProcessInfo, ProcessOptions } from "../types";
+import type { ActionResult, Getter, LogStreamMessage, ProcessInfo, ProcessOptions } from "../types";
 export * from "../types";
 
 export class ProcClient {
@@ -29,21 +29,21 @@ export class ProcClient {
         return this.get("/list");
     }
 
-    async stop(getter: Getter): Promise<ProcessInfo[]> {
+    async stop(getter: Getter): Promise<ActionResult> {
         return this.post(`/stop/${getter}`);
     }
 
-    async restart(getter: Getter): Promise<ProcessInfo[]> {
+    async restart(getter: Getter): Promise<ActionResult> {
         return this.post(`/restart/${getter}`);
     }
 
-    async remove(getter: Getter): Promise<ProcessInfo[]> {
+    async remove(getter: Getter): Promise<ActionResult> {
         return this.post(`/remove/${getter}`);
     }
 
-    async start(config: ProcessOptions): Promise<ProcessInfo[]>
-    async start(getter: Getter): Promise<ProcessInfo[]>
-    async start(config: ProcessOptions | Getter): Promise<ProcessInfo[]> {
+    async start(config: ProcessOptions): Promise<ActionResult>
+    async start(getter: Getter): Promise<ActionResult>
+    async start(config: ProcessOptions | Getter): Promise<ActionResult> {
         if (typeof config === "number" || typeof config === "string") {
             return this.post(`/start/${config}`);
         }

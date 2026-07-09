@@ -8,7 +8,15 @@ import path from "path";
 import readline from "node:readline";
 import { readdirSync, statSync } from "node:fs";
 import { ProcClient } from "../client/index";
-import { Status, type ProcessInfo, type ProcessOptions } from "../types";
+import { Status, type ActionResult, type ProcessInfo, type ProcessOptions } from "../types";
+import {
+    CURRENT_VERSION,
+    compareVersions,
+    fetchLatestRelease,
+    installUpdate,
+    printUpdateNagIfAvailable,
+    refreshUpdateCacheIfStale,
+} from "./update";
 
 // ── Ecosystem file support ────────────────────────────────────────────────────
 
@@ -207,15 +215,17 @@ function colorStatus(s: string): string {
     return s;
 }
 
-function printTable(procs: ProcessInfo[]): void {
+function printTable(procs: ProcessInfo[], highlight?: Set<number>): void {
     if (procs.length === 0) {
         console.log("No processes.");
         return;
     }
 
     const hasErrors = procs.some(p => p.lastError);
+    const showMarker = !!highlight && highlight.size > 0;
 
     const rows = procs.map(p => ({
+        marker: highlight?.has(p.id) ? "→" : "",
         id: String(p.id),
         name: p.name,
         status: p.status ?? "unknown",
@@ -226,9 +236,10 @@ function printTable(procs: ProcessInfo[]): void {
         error: p.lastError ?? "-",
     }));
 
-    const headers = { id: "ID", name: "NAME", status: "STATUS", cpu: "CPU", mem: "MEM", uptime: "UPTIME", pid: "PID", error: "ERROR" };
+    const headers = { marker: "", id: "ID", name: "NAME", status: "STATUS", cpu: "CPU", mem: "MEM", uptime: "UPTIME", pid: "PID", error: "ERROR" };
     const baseCols = ["id", "name", "status", "cpu", "mem", "uptime", "pid"] as const;
-    const cols = hasErrors ? [...baseCols, "error"] : baseCols as readonly string[];
+    const withMarker = showMarker ? ["marker", ...baseCols] : baseCols as readonly string[];
+    const cols = hasErrors ? [...withMarker, "error"] : withMarker;
 
     const widths = Object.fromEntries(
         cols.map(c => [c, Math.max(headers[c as keyof typeof headers].length, ...rows.map(r => r[c as keyof typeof r].length))])
@@ -242,6 +253,7 @@ function printTable(procs: ProcessInfo[]): void {
     for (const row of rows) {
         const cells = cols.map(c => {
             const val = pad(row[c as keyof typeof row], widths[c]!);
+            if (c === "marker" && row.marker) return process.stdout.isTTY ? COLOR.yellow(val) : val;
             if (c === "status") return colorStatus(val);
             if (c === "error" && row.error !== "-") return process.stdout.isTTY ? COLOR.red(val) : val;
             return val;
@@ -328,7 +340,17 @@ async function interactiveNew(): Promise<ProcessOptions | null> {
 
 const program = new Command("pd")
     .description("process-daemon CLI")
-    .version("1.0.0");
+    .version(CURRENT_VERSION);
+
+program.hook("preAction", (_thisCommand, actionCommand) => {
+    // Fire-and-forget: refreshes the cached "latest version" if it's stale, never
+    // blocks the actual command. Skipped for `update` since it does its own fresh check.
+    if (actionCommand.name() !== "update") void refreshUpdateCacheIfStale();
+});
+
+program.hook("postAction", async (_thisCommand, actionCommand) => {
+    if (actionCommand.name() !== "update") await printUpdateNagIfAvailable();
+});
 
 program
     .command("list")
@@ -355,7 +377,8 @@ program
 
         // Start existing process by name/id
         if (getter !== undefined) {
-            printTable(await client.start(getter));
+            const result = await client.start(getter);
+            printTable(result.processes, new Set(result.affected));
             return;
         }
 
@@ -387,14 +410,16 @@ program
                 }
 
                 console.log(`Starting ${apps.length} process${apps.length === 1 ? "" : "es"} from ${path.basename(ecoPath)}`);
-                let lastProcs: ProcessInfo[] = [];
+                let lastResult: ActionResult = { affected: [], processes: [] };
+                const affected = new Set<number>();
                 for (const app of apps) {
                     const s = p.spinner();
                     s.start(app.name);
-                    lastProcs = await client.start(app);
+                    lastResult = await client.start(app);
+                    for (const id of lastResult.affected) affected.add(id);
                     s.stop(app.name);
                 }
-                printTable(lastProcs);
+                printTable(lastResult.processes, affected);
                 return;
             }
 
@@ -424,20 +449,20 @@ program
             };
             const s = p.spinner();
             s.start(`Starting ${config.name}`);
-            const procs = await client.start(config);
+            const result = await client.start(config);
             s.stop(`Started ${config.name}`);
-            printTable(procs);
+            printTable(result.processes, new Set(result.affected));
             return;
         }
 
         // Interactive
-        const result = await interactiveNew();
-        if (!result) process.exit(0);
+        const newProc = await interactiveNew();
+        if (!newProc) process.exit(0);
         const s = p.spinner();
-        s.start(`Starting ${result.name}`);
-        const procs = await client.start(result);
-        s.stop(`Started ${result.name}`);
-        printTable(procs);
+        s.start(`Starting ${newProc.name}`);
+        const result = await client.start(newProc);
+        s.stop(`Started ${newProc.name}`);
+        printTable(result.processes, new Set(result.affected));
     });
 
 program
@@ -445,7 +470,8 @@ program
     .description("Stop a process (name, id, or all)")
     .action(async (getter: string) => {
         await ensureDaemon();
-        printTable(await client.stop(getter));
+        const result = await client.stop(getter);
+        printTable(result.processes, new Set(result.affected));
     });
 
 program
@@ -453,7 +479,8 @@ program
     .description("Restart a process (name, id, or all)")
     .action(async (getter: string) => {
         await ensureDaemon();
-        printTable(await client.restart(getter));
+        const result = await client.restart(getter);
+        printTable(result.processes, new Set(result.affected));
     });
 
 program
@@ -462,7 +489,8 @@ program
     .description("Remove a process (name, id, or all)")
     .action(async (getter: string) => {
         await ensureDaemon();
-        printTable(await client.remove(getter));
+        const result = await client.remove(getter);
+        printTable(result.processes, new Set(result.affected));
     });
 
 program
@@ -504,6 +532,54 @@ program
             if (isAxiosError(e) && e.code === "ERR_CANCELED") return;
             throw e;
         });
+    });
+
+program
+    .command("update")
+    .description("Update pd and pdd to the latest GitHub release")
+    .option("-y, --yes", "Skip the confirmation prompt")
+    .action(async (opts) => {
+        const s = p.spinner();
+        s.start("Checking for updates");
+        let release;
+        try {
+            release = await fetchLatestRelease();
+        } catch (e) {
+            s.stop("Failed to check for updates");
+            process.stderr.write(`error: ${e instanceof Error ? e.message : e}\n`);
+            process.exit(1);
+        }
+        s.stop(`Latest release: ${release.tag}`);
+
+        if (compareVersions(release.version, CURRENT_VERSION) <= 0) {
+            console.log(`Already up to date (v${CURRENT_VERSION}).`);
+            return;
+        }
+
+        console.log(`\n${release.name}  (v${CURRENT_VERSION} → v${release.version})\n`);
+        if (release.body.trim()) {
+            console.log(release.body.trim());
+            console.log("");
+        }
+
+        if (!opts.yes) {
+            const confirmed = await p.confirm({
+                message: "Install this update? This overwrites the current pd/pdd binaries and restarts the pdd service.",
+            });
+            if (p.isCancel(confirmed) || !confirmed) {
+                p.cancel("Cancelled.");
+                return;
+            }
+        }
+
+        try {
+            await installUpdate(release);
+        } catch (e) {
+            process.stderr.write(`error: ${e instanceof Error ? e.message : e}\n`);
+            process.exit(1);
+        }
+
+        console.log(`Updated to v${release.version}.`);
     });
 
 program.parseAsync(process.argv);

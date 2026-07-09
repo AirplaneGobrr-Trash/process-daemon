@@ -42,6 +42,13 @@ export interface ProcessInfo {
     logFiles?: string[];
 }
 
+export interface ActionResult {
+    // ids of processes the action actually applied to
+    affected: number[];
+    // full process list, refreshed (monit included) after the action ran
+    processes: ProcessInfo[];
+}
+
 export interface LogStreamMessage {
     id: number;
     type: "out" | "err";

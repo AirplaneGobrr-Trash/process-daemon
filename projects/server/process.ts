@@ -150,6 +150,7 @@ export class Process extends EventEmitter {
             cwd: this.info.cwd,
             stdout: "pipe",
             stderr: "pipe",
+            detached: true,
 
             onExit(_subprocess, exitCode, _signalCode, error) {
                 if (that.stableTimer) clearTimeout(that.stableTimer);
@@ -240,7 +241,17 @@ export class Process extends EventEmitter {
         this.status = Status.Stopping;
 
         this._stopping = true;
-        this.spawned?.kill();
+        if (this.spawned) {
+            // The child is spawned detached (its own process group), so a plain
+            // spawned.kill() only signals it, not any subprocess it forked internally
+            // (e.g. "npm start" wrapping a real server). Signal the whole group instead
+            // by targeting the negative pid, so wrapper-spawned children die with it.
+            try {
+                process.kill(-this.spawned.pid, "SIGTERM");
+            } catch {
+                // Group already gone
+            }
+        }
         await this.spawned?.exited;
 
         this.status = Status.Stopped;
