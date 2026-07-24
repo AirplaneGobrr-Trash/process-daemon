@@ -107,6 +107,16 @@ async function appendToEcosystemFile(filePath: string, opts: ProcessOptions): Pr
     await Bun.write(resolved, JSON.stringify(data, null, 2) + "\n");
 }
 
+function parseEnvPairs(pairs: string[]): Record<string, string> {
+    const env: Record<string, string> = {};
+    for (const kv of pairs) {
+        const eq = kv.indexOf("=");
+        if (eq === -1) { process.stderr.write(`error: invalid env var "${kv}" (expected KEY=VALUE)\n`); process.exit(1); }
+        env[kv.slice(0, eq)] = kv.slice(eq + 1);
+    }
+    return env;
+}
+
 // ── Path prompt with tab completion ──────────────────────────────────────────
 
 function makePathCompleter(baseCwd?: string) {
@@ -262,6 +272,17 @@ function printTable(procs: ProcessInfo[], highlight?: Set<number>): void {
     }
 }
 
+// pd and pdd are separate binaries; if pdd wasn't restarted after a pd update
+// (e.g. `pd update`'s service restart failed), an older daemon can still return
+// a bare ProcessInfo[] instead of an ActionResult, so guard before indexing in.
+function printActionResult(result: ActionResult, highlight?: Set<number>): void {
+    if (!result || !Array.isArray(result.processes)) {
+        process.stderr.write("error: unexpected response from pdd - the daemon may be running an older version.\n  → try: sudo systemctl restart pdd\n");
+        process.exit(1);
+    }
+    printTable(result.processes, highlight);
+}
+
 async function interactiveNew(): Promise<ProcessOptions | null> {
     p.intro("New process");
 
@@ -378,7 +399,7 @@ program
         // Start existing process by name/id
         if (getter !== undefined) {
             const result = await client.start(getter);
-            printTable(result.processes, new Set(result.affected));
+            printActionResult(result, new Set(result.affected));
             return;
         }
 
@@ -419,7 +440,7 @@ program
                     for (const id of lastResult.affected) affected.add(id);
                     s.stop(app.name);
                 }
-                printTable(lastResult.processes, affected);
+                printActionResult(lastResult, affected);
                 return;
             }
 
@@ -432,12 +453,7 @@ program
 
         // Flag-based new process
         if (opts.name && opts.cwd) {
-            const env: Record<string, string> = {};
-            for (const kv of (opts.env ?? []) as string[]) {
-                const eq = kv.indexOf("=");
-                if (eq === -1) { process.stderr.write(`error: invalid env var "${kv}" (expected KEY=VALUE)\n`); process.exit(1); }
-                env[kv.slice(0, eq)] = kv.slice(eq + 1);
-            }
+            const env = parseEnvPairs((opts.env ?? []) as string[]);
             const config: ProcessOptions = {
                 name: opts.name,
                 cwd: opts.cwd,
@@ -451,7 +467,7 @@ program
             s.start(`Starting ${config.name}`);
             const result = await client.start(config);
             s.stop(`Started ${config.name}`);
-            printTable(result.processes, new Set(result.affected));
+            printActionResult(result, new Set(result.affected));
             return;
         }
 
@@ -462,7 +478,7 @@ program
         s.start(`Starting ${newProc.name}`);
         const result = await client.start(newProc);
         s.stop(`Started ${newProc.name}`);
-        printTable(result.processes, new Set(result.affected));
+        printActionResult(result, new Set(result.affected));
     });
 
 program
@@ -471,7 +487,7 @@ program
     .action(async (getter: string) => {
         await ensureDaemon();
         const result = await client.stop(getter);
-        printTable(result.processes, new Set(result.affected));
+        printActionResult(result, new Set(result.affected));
     });
 
 program
@@ -480,7 +496,7 @@ program
     .action(async (getter: string) => {
         await ensureDaemon();
         const result = await client.restart(getter);
-        printTable(result.processes, new Set(result.affected));
+        printActionResult(result, new Set(result.affected));
     });
 
 program
@@ -490,7 +506,18 @@ program
     .action(async (getter: string) => {
         await ensureDaemon();
         const result = await client.remove(getter);
-        printTable(result.processes, new Set(result.affected));
+        printActionResult(result, new Set(result.affected));
+    });
+
+program
+    .command("env <getter> <kv...>")
+    .description("Update environment variables for a process (name, id, or all); restarts it if running")
+    .option("--replace", "Replace all env vars instead of merging")
+    .action(async (getter: string, kv: string[], opts) => {
+        await ensureDaemon();
+        const env = parseEnvPairs(kv);
+        const result = await client.setEnv(getter, env, { replace: !!opts.replace });
+        printActionResult(result, new Set(result.affected));
     });
 
 program

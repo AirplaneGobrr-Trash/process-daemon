@@ -1,5 +1,5 @@
-import type { ProcessOptions, ProcessInfo, Getter, Actions, ActionResult } from "../types";
-import { Process } from "./process";
+import { Status, type ProcessOptions, type ProcessInfo, type Getter, type Actions, type ActionResult } from "../types";
+import { Process, killOrphan } from "./process";
 
 const procs: ProcessInfo[] = [];
 
@@ -61,6 +61,11 @@ async function respawn() {
     }
 
     for (let project of projects) {
+        // A previous run may have crashed without stopping its children (they're
+        // spawned detached, so they can outlive the daemon). Clean up anything
+        // still running under the last known PID before we spawn a replacement.
+        if (project.monit?.pid) await killOrphan(project.monit.pid);
+
         createProcess(project.startOptions, project.id, project.logFiles ?? []);
 
         if (project.lastAction) await doAction(project.id, project.lastAction);
@@ -128,6 +133,22 @@ async function remove(getter: Getter): Promise<ActionResult> {
     return { affected, processes: await list() };
 }
 
+async function updateEnv(getter: Getter, envVars: Record<string, string>, replace = false): Promise<ActionResult> {
+    const projects = getProjects(getter);
+    await Promise.all(
+        projects.map(async p => {
+            if (!p.process) return;
+            p.process.setEnv(envVars, replace);
+            p.startOptions.env = p.process.info.env;
+            if (p.process.status === Status.Online || p.process.status === Status.Starting) {
+                p.lastAction = "restart";
+                await p.process.restart();
+            }
+        })
+    );
+    return { affected: projects.map(p => p.id), processes: await list() };
+}
+
 async function list() {
     await Promise.all(procs.map(v => v.process?.getResourceUsage()));
     return [...procs];
@@ -139,6 +160,7 @@ const proc = {
     stop,
     restart,
     remove,
+    env: updateEnv,
     list,
     save,
     respawn

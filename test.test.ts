@@ -10,7 +10,7 @@ async function main() {
             EXAMPLE_VAR: "123"
         },
         restart: false
-    });
+    }, 1);
 
     // Listen to stdout/stderr events
     proc.on("out", (msg) => {

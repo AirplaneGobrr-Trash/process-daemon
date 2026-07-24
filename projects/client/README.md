@@ -87,6 +87,15 @@ await pd.restart(1);
 await pd.remove("all");
 ```
 
+### `pd.setEnv(getter, env, options?)` - update a process's env vars
+
+Merges the given vars into the process's existing env by default. Pass `{ replace: true }` to drop everything else. If the process is currently running, it's restarted immediately so the change takes effect (env is only read at spawn time); a stopped process just has its stored options updated for the next start.
+
+```ts
+await pd.setEnv("myapp", { PORT: "4000" });                       // merge
+await pd.setEnv("myapp", { PORT: "4000" }, { replace: true });    // replace entirely
+```
+
 ### `pd.logs(getter)` - get stdout and stderr
 
 ```ts

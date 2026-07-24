@@ -1,6 +1,6 @@
 {
   "name": "@airplanegobrr/process-daemon",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -18,6 +18,7 @@
     "build:sdk": "tsup",
     "build:server": "bun run build.ts",
     "build": "bun run build:sdk && bun run build:server",
+    "release": "bun run release.ts",
     "link": "cd projects/client && bun link"
   },
   "devDependencies": {

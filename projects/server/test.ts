@@ -8,7 +8,7 @@ const proc = new Process({
     script: script,
     restart: false,
     name: "Test_script"
-});
+}, 1);
 
 await proc.start();
 proc.on("out", async (data) => {

@@ -19,6 +19,31 @@ async function checkExists(p: string) {
     return false;
 }
 
+export function isAlive(pid: number): boolean {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (err) {
+        // EPERM means it exists but we can't signal it; still alive.
+        return (err as NodeJS.ErrnoException)?.code === "EPERM";
+    }
+}
+
+// Sends the whole process group a SIGTERM (mirroring Process.stop()) and waits
+// briefly for it to die. Used on respawn to clean up a child left running from
+// before a daemon crash, so we don't spawn a duplicate on top of it.
+export async function killOrphan(pid: number): Promise<void> {
+    if (!isAlive(pid)) return;
+    try {
+        process.kill(-pid, "SIGTERM");
+    } catch {
+        return;
+    }
+    for (let i = 0; i < 10 && isAlive(pid); i++) {
+        await Bun.sleep(200);
+    }
+}
+
 function resolveInterpreter(name: string): string | null {
     const found = Bun.which(name);
     if (found) return found;
@@ -263,6 +288,12 @@ export class Process extends EventEmitter {
         await this.stop();
 
         await this.start();
+    }
+
+    // Updates the env vars used on the *next* spawn. Doesn't touch a currently
+    // running process; callers that want the change applied immediately restart it.
+    setEnv(env: Record<string, string>, replace = false) {
+        this.info.env = replace ? { ...env } : { ...this.info.env, ...env };
     }
 
     async remove() {

@@ -43,6 +43,7 @@ The server exposes an HTTP API on `:3830`. The client SDK and CLI both talk to i
 | POST   | `/stop/:getter`    | Stop a process, returns `ActionResult`     |
 | POST   | `/restart/:getter` | Restart a process, returns `ActionResult`  |
 | POST   | `/remove/:getter`  | Stop and remove a process, returns `ActionResult` |
+| POST   | `/env/:getter`     | Update env vars for a process (body: `{ env, replace? }`), returns `ActionResult` |
 | GET    | `/logs/:getter`    | Returns `{ out: string, err: string }`. Optional `?runs=N` limits to the last N runs. |
 | GET    | `/logs/:getter/stream` | Server-Sent Events stream of live stdout/stderr lines as they're produced, as `{ id, type: "out" \| "err", line }` frames. Matches every process the getter resolves to (including `"all"`). |
 
@@ -104,6 +105,7 @@ interface ActionResult {
 - **Interactive path prompts use readline tab completion**: `cwd`, `script`, and ecosystem file path prompts bypass `@clack/prompts` (which has no completer hook) and use a `readline.createInterface` with a custom `completer`. The script completer receives the entered `cwd` as `baseCwd` so it resolves relative paths against that directory for the filesystem read, but returns completions as relative paths so the user types `src/index.ts` not `/srv/api/src/index.ts`. The max-restarts validate uses `v && (...)` so pressing Enter on an empty input passes through to the `"5"` defaultValue rather than failing validation.
 - **Live logs use Server-Sent Events, not WebSockets**: `Process` already emits an `"out"` event (`{ type: "out" | "err", line }`) for every chunk written to its log files. `GET /logs/:getter/stream` subscribes to that event on every matched process and writes `data: {...}\n\n` frames; the listener is removed on `req.on("close")` so a disconnected client doesn't leak listeners on a long-lived `Process`. The client SDK's `streamLogs()` reads the response as a raw Node stream (`responseType: "stream"`, `timeout: 0` to override the instance's 5s default) and splits on `\n\n` itself rather than pulling in an SSE/EventSource dependency. `pd logs <getter> -f` prints history first, then calls `streamLogs()` until Ctrl+C aborts the request.
 - **Managed processes are spawned detached and stopped via process-group kill**: `Bun.spawn` is called with `detached: true`, making the child a session/process-group leader (`setsid`). `stop()` signals the whole group with `process.kill(-spawned.pid, "SIGTERM")` instead of `spawned.kill()`. Without this, a managed command that's itself a wrapper (`npm start`, a shell script, `next start`) would only have its wrapper process killed; any real server it forked internally would be reparented to init and keep running (and keep serving traffic) while `pd ls` reported the process as stopped.
+- **Env vars are updated in place, not by recreating the process**: `POST /env/:getter` (`ProcClient.setEnv()`, `pd env <getter> KEY=VALUE...`) merges the given vars into `info.env` on the matching `Process`(es) by default, or fully replaces it with `--replace`/`{ replace: true }`. Since env is only read at spawn time, a process that's currently `online`/`starting` is restarted immediately so the change takes effect; a stopped process just has its stored options updated for the next `start()`. The merged/replaced env is written back to `startOptions.env` on the `ProcessInfo` so it persists to `processes.json` and survives a daemon restart.
 - **Action endpoints return the full process list, not just the affected ones**: `start`/`stop`/`restart`/`remove` in `manager.ts` return `{ affected, processes }` where `processes` is a freshly `list()`-ed snapshot (monit included) of every process, and `affected` is the ids the getter actually matched. Previously these returned only the matched `ProcessInfo[]` with stale `monit` (since only `list()` calls `getResourceUsage()`), so `pd restart 1` showed just process 1 with its old PID/CPU/mem instead of the new ones. The CLI renders the full table with a `→` marker on affected rows (`printTable(processes, highlight)` in `cli/index.ts`) instead of a single-row table.
 - **Update checks are cached and never block a command**: `cli/update.ts` reads/writes `~/.cache/pd/update-check.json` (`{ checkedAt, latestVersion, releaseUrl }`). A `preAction` Commander hook fires `refreshUpdateCacheIfStale()` without awaiting it (skipped for `update` itself), which only hits the GitHub releases API if the cache is missing or older than 24h, with a 2s abort timeout. A `postAction` hook then prints the nag banner from whatever is cached (no network call), so the banner is always instant and reflects the previous command's background refresh rather than the current one.
 - **The package version is the single source of truth**: `package.json`'s `version` field is imported directly into `cli/update.ts` (bundled at compile time, since `bun build --compile` inlines JSON imports) and used both for `pd --version` and for the update-available comparison. Release tags on GitHub aren't strict semver (`dev-1.0.1`); `compareVersions()` strips any non-digit prefix before comparing dotted numeric parts.
@@ -165,6 +167,32 @@ bun run server       # run daemon in dev (no compile)
 bun run cli -- <args> # run CLI in dev (no compile), e.g. bun run cli -- list
 ```
 
+## Release
+
+`release.ts` (root) publishes a GitHub release from a `Release.md` file via `gh release create`.
+
+`Release.md` format:
+
+```
+title: Version 1.0.0
+version: v1.0.0
+Initial release description
+```
+
+- First line starting with `title:` becomes the release title (prefix stripped, trimmed).
+- First line starting with `version:` becomes the release tag (prefix stripped, trimmed, keep the `v`).
+- Every other line becomes the release notes body, in order.
+
+Run it with:
+
+```bash
+bun run release.ts                          # Release.md + ./dist/app.zip
+bun run release.ts Release.md ./dist/app.zip # explicit paths
+bun run release               # package.json script, same defaults as above
+```
+
+When the user asks to "make a release note" / "make a release", write or update `Release.md` in this format, then run `release.ts`. Since `gh release create` publishes a real GitHub release, confirm the title/version/notes and the asset path with the user before running it.
+
 ## CLI (`pd`)
 
 Built with Commander. Entry: `projects/cli/index.ts`.
@@ -179,6 +207,7 @@ Built with Commander. Entry: `projects/cli/index.ts`.
 | `pd stop <getter>` | Stop (accepts name, id, or `all`) |
 | `pd restart <getter>` | Restart |
 | `pd remove <getter>` / `pd rm` | Remove |
+| `pd env <getter> KEY=VALUE...` | Update env vars (merges by default; `--replace` to overwrite); restarts the process if it's running |
 | `pd logs <getter> [--out\|--err] [--runs N]` | Show stdout and/or stderr (last 3 runs by default) |
 | `pd update [-y\|--yes]` | Update `pd`/`pdd` to the latest GitHub release |
 

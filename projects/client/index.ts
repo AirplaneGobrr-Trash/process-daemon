@@ -50,6 +50,12 @@ export class ProcClient {
         return this.post("/start", config);
     }
 
+    // Merges (or, with `replace`, fully replaces) a process's env vars. Restarts the
+    // process to apply the change immediately if it's currently running.
+    async setEnv(getter: Getter, env: Record<string, string>, options?: { replace?: boolean }): Promise<ActionResult> {
+        return this.post(`/env/${getter}`, { env, replace: options?.replace });
+    }
+
     async logs(getter: Getter, options?: { runs?: number }): Promise<{ out: string, err: string }> {
         const qs = options?.runs !== undefined ? `?runs=${options.runs}` : "";
         return this.get(`/logs/${getter}${qs}`);
