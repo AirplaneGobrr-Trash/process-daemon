@@ -33,6 +33,20 @@ const notes = notesLines.join("\n").trim();
 if (!title) throw new Error(`No "title:" line found in ${mdPath}`);
 if (!version) throw new Error(`No "version:" line found in ${mdPath}`);
 
+// `pd update` compares against the version baked into the binary from package.json,
+// so a tag that doesn't match it would make every install nag (or never nag) forever.
+const pkgVersion = (await Bun.file("package.json").json()).version as string;
+if (version.replace(/^\D+/, "") !== pkgVersion) {
+    throw new Error(`Release tag "${version}" doesn't match package.json version "${pkgVersion}"`);
+}
+
+// The default assets are gitignored build output, so rebuild them right before
+// uploading instead of trusting whatever stale .gz files happen to be on disk.
+if (assetPaths === defaultAssetPaths) {
+    console.log("Building binaries...");
+    await $`bun run build:server`;
+}
+
 console.log(`Creating release ${version} ("${title}") from ${assetPaths.join(", ")}...`);
 
 await $`gh release create ${version} ${assetPaths} --title ${title} --notes ${notes}`;

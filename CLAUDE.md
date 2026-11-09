@@ -21,6 +21,7 @@ Three components, all in `projects/`:
 projects/
   server/
     server.ts     : Express HTTP server, defines all routes
+    dashboard.html: web UI served at GET /, inlined into the pdd binary
     manager.ts    : in-memory process list, persistence, actions
     process.ts    : child process lifecycle (spawn, log, restart)
   client/
@@ -37,6 +38,7 @@ The server exposes an HTTP API on `:3830`. The client SDK and CLI both talk to i
 
 | Method | Route              | Description                        |
 |--------|--------------------|------------------------------------|
+| GET    | `/`                | Web dashboard (single static HTML page) |
 | GET    | `/list`            | List all processes with monit data |
 | POST   | `/start`           | Start a new process (body: ProcessOptions), returns `ActionResult` |
 | POST   | `/start/:getter`   | Start an existing stopped process, returns `ActionResult` |
@@ -108,7 +110,7 @@ interface ActionResult {
 - **Interpreter is resolved to an absolute path**: `resolveInterpreter()` in `process.ts` tries `Bun.which` first, then falls back to known install locations (`~/.bun/bin`, `/usr/local/bin`, `/usr/bin`, `/opt/homebrew/bin`). The resolved path is passed directly to `Bun.spawn`, so systemd's stripped PATH never causes a "No interpreter" error.
 - **Bun PATH is written by the CLI, not hardcoded in the service**: `ensureDaemon()` writes `PATH=<bun-dir>:...` to `/var/lib/pdd/env` before starting the service. The service file uses `EnvironmentFile=-/var/lib/pdd/env` (the `-` means the file is optional, so cold starts without a prior `pd` invocation still work via `resolveInterpreter`'s fallback).
 - **`pd list` shows ERROR column only when needed**: the column is omitted when no process has a `lastError`, keeping normal output clean. When present, errors are shown in red.
-- **Ecosystem files are PM2-compatible**: `pd start` auto-detects `ecosystem.config.js`, `ecosystem.config.cjs`, `ecosystem.config.json`, or `ecosystem.json` in cwd. `--efile [path]` overrides the path. PM2 field names (`autorestart`, `max_restarts`) are normalized to the native ones on load. The save path (after interactive creation) always writes PM2-compatible JSON (`{ apps: [...] }`). JS/CJS files are loaded via dynamic `import()`.
+- **Ecosystem files are PM2-compatible**: `pd start` auto-detects `ecosystem.config.js`, `ecosystem.config.cjs`, `ecosystem.config.json`, or `ecosystem.json` in cwd. `--efile [path]` overrides the path. PM2 field names (`autorestart`, `max_restarts`) are normalized to the native ones on load. The save path (after interactive creation) always writes PM2-compatible JSON (`{ apps: [...] }`). JS/CJS files are loaded via dynamic `import()`. `cwd` in an ecosystem file is relative to the file's own directory (missing means the file's directory), and the CLI resolves it to an absolute path before sending it, since the daemon runs from `/var/lib/pdd`. Saving writes `cwd` back relative to the file (`"."` when it's the same directory), so the file stays portable. `--cwd` and the interactive prompt are also resolved against the shell's cwd.
 - **`_stopping` is never reset inside `stop()`**: it is only cleared at the top of a manual `start()` call (`isAutoRestart = false`). This prevents a race where `onExit` fires as a separate microtask after `await exited` resolves but before `_stopping` was (previously) reset to `false`, and also stops any pending `setTimeout` auto-restart from firing after a manual stop (`start(true)` returns immediately when `_stopping` is set).
 - **`getResourceUsage` guards against ESRCH**: checks `spawned.exitCode !== null` before calling `pidusage`, and wraps the call in try/catch to handle the narrow race where the process exits between the check and the pidusage call. Without this, `pd list` would 500 whenever any process was stopped.
 - **Interactive path prompts use readline tab completion**: `cwd`, `script`, and ecosystem file path prompts bypass `@clack/prompts` (which has no completer hook) and use a `readline.createInterface` with a custom `completer`. The script completer receives the entered `cwd` as `baseCwd` so it resolves relative paths against that directory for the filesystem read, but returns completions as relative paths so the user types `src/index.ts` not `/srv/api/src/index.ts`. The max-restarts validate uses `v && (...)` so pressing Enter on an empty input passes through to the `"5"` defaultValue rather than failing validation.
@@ -119,6 +121,7 @@ interface ActionResult {
 - **Update checks are cached and never block a command**: `cli/update.ts` reads/writes `~/.cache/pd/update-check.json` (`{ checkedAt, latestVersion, releaseUrl }`). A `preAction` Commander hook fires `refreshUpdateCacheIfStale()` without awaiting it (skipped for `update` itself), which only hits the GitHub releases API if the cache is missing or older than 24h, with a 2s abort timeout. A `postAction` hook then prints the nag banner from whatever is cached (no network call), so the banner is always instant and reflects the previous command's background refresh rather than the current one.
 - **The package version is the single source of truth**: `package.json`'s `version` field is imported directly into `cli/update.ts` (bundled at compile time, since `bun build --compile` inlines JSON imports) and used both for `pd --version` and for the update-available comparison. Release tags on GitHub aren't strict semver (`dev-1.0.1`); `compareVersions()` strips any non-digit prefix before comparing dotted numeric parts.
 - **`pd update` re-runs the install.sh binary-swap logic in-process**: fetches the latest release (with its changelog body, printed before the confirm prompt), downloads `pd-linux-$ARCH`/`pdd-linux-$ARCH` from the `releases/latest/download/` alias, `sudo install`s them over `/usr/local/bin/{pd,pdd}`, then `sudo systemctl restart pdd`. Requires confirmation unless `-y/--yes` is passed, since it overwrites system binaries and restarts a service.
+- **The web dashboard is one static file, not a second server**: `projects/server/dashboard.html` is plain HTML/CSS/JS with no build step or framework, imported into `server.ts` with `with { type: "text" }` so `bun build --compile` inlines it into `pdd`, and served at `GET /` on the same `:3830` port. It only uses the existing API: polls `/list` every 2s (paused while the tab is hidden), calls `POST /start|stop|restart/:id` for the row buttons, and on row click shows `/logs/:id?runs=1` followed by a live `EventSource` on `/logs/:id/stream`. Log output is capped at 2000 lines in the page. It adds no auth, so the same trusted-network assumption as the API applies. `PDD_PORT` overrides the listen port, for running a test daemon next to the real one (the CLI/SDK still default to 3830).
 - **Release assets are gzipped, not raw binaries**: `bun build --compile` embeds the whole Bun runtime, so each of the four binaries is ~90MB regardless of app code size (confirmed: minify and strip each save well under 1MB, not worth it). `build.ts` gzips every binary after compiling (`pdd-linux-$ARCH.gz`, `pd-linux-$ARCH.gz`, ~62% smaller), and those `.gz` files are what get uploaded to the GitHub release, not the raw binaries. `install.sh` and `cli/update.ts`'s `downloadAsset()` both fetch the `.gz` variant and decompress it (`gunzip` / `Bun.gunzipSync`) before installing.
 
 ## Log file behavior
@@ -200,10 +203,13 @@ Initial release description
 Run it with:
 
 ```bash
-bun run release.ts                          # Release.md + ./dist/app.zip
-bun run release.ts Release.md ./dist/app.zip # explicit paths
-bun run release               # package.json script, same defaults as above
+bun run release.ts                    # Release.md + the four {pd,pdd}-linux-{x64,arm64}.gz binaries
+bun run release.ts Release.md a.gz b.gz # explicit notes file and asset paths
+bun run release                       # package.json script, same defaults as above
 ```
+
+- The release tag's numeric part must match `package.json`'s `version` (`dev-1.3.0` ↔ `1.3.0`), or the script refuses to publish, since `pd update` compares against the package version.
+- With the default assets, the script runs `bun run build:server` first, so the uploaded `.gz` files are always freshly built from the current tree. Explicit asset paths are uploaded as given, with no build.
 
 When the user asks to "make a release note" / "make a release", write or update `Release.md` in this format, then run `release.ts`. Since `gh release create` publishes a real GitHub release, confirm the title/version/notes and the asset path with the user before running it.
 

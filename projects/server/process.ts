@@ -151,8 +151,10 @@ export class Process extends EventEmitter {
         if (this.removed) return;
         if (isAutoRestart && this._stopping) return;
         // this.spawned.exited is a Promise, always truthy, so checking it directly
-        // never detects a still-running child; exitCode is null until it exits.
-        if (this.spawned && this.spawned.exitCode === null) return;
+        // never detects a still-running child. exitCode alone isn't enough either: a
+        // child killed by a signal (every stop() SIGTERM) exits with exitCode null and
+        // only signalCode set, which would make start() a silent no-op forever after.
+        if (this.spawned && this.spawned.exitCode === null && this.spawned.signalCode === null) return;
         if (this._starting) return;
         this._starting = true;
         if (!isAutoRestart) {
@@ -293,7 +295,7 @@ export class Process extends EventEmitter {
     }
 
     async getResourceUsage(): Promise<Stat | undefined> {
-        if (!this.spawned || this.spawned.exitCode !== null) return;
+        if (!this.spawned || this.spawned.exitCode !== null || this.spawned.signalCode !== null) return;
         try {
             this.monit = await pidusage(this.spawned.pid) as Stat;
         } catch {

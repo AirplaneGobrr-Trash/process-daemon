@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pdd</title>
+<style>
+    :root {
+        --bg: #f7f7f8; --panel: #ffffff; --text: #1d1d20; --muted: #6b6b75;
+        --border: #e2e2e6; --accent: #3b6fe0; --green: #1f8a4c; --red: #c9372c;
+        --yellow: #a86b00; --log-bg: #fbfbfc; --hover: #f1f2f5;
+    }
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --bg: #141417; --panel: #1c1c20; --text: #e6e6ea; --muted: #8e8e99;
+            --border: #2c2c33; --accent: #6d95ff; --green: #4cc27e; --red: #ff6b5e;
+            --yellow: #e0a63a; --log-bg: #111114; --hover: #24242a;
+        }
+    }
+    * { box-sizing: border-box; }
+    body {
+        margin: 0; background: var(--bg); color: var(--text);
+        font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 40px; }
+    header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
+    h1 { font-size: 18px; margin: 0; }
+    .muted { color: var(--muted); }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    th { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover { background: var(--hover); }
+    tbody tr.selected { background: var(--hover); box-shadow: inset 3px 0 var(--accent); }
+    .num { font-variant-numeric: tabular-nums; }
+    .status::before { content: "●"; margin-right: 6px; }
+    .s-online { color: var(--green); }
+    .s-error { color: var(--red); }
+    .s-starting, .s-stopping { color: var(--yellow); }
+    .s-stopped { color: var(--muted); }
+    .err-text { color: var(--red); white-space: normal; min-width: 160px; }
+    .actions { text-align: right; }
+    button {
+        font: inherit; font-size: 12px; padding: 3px 9px; margin-left: 4px; cursor: pointer;
+        color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 5px;
+    }
+    button:hover { border-color: var(--accent); color: var(--accent); }
+    button:disabled { opacity: .5; cursor: default; }
+    .empty { padding: 24px; text-align: center; }
+    #logs { margin-top: 16px; display: none; }
+    #logs.open { display: block; }
+    .logs-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+    .logs-head strong { flex: 1; }
+    .live { font-size: 12px; color: var(--muted); }
+    .live.on { color: var(--green); }
+    pre {
+        margin: 0; padding: 12px; height: 420px; overflow: auto; background: var(--log-bg);
+        border-radius: 0 0 8px 8px; font: 12px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+        white-space: pre-wrap; word-break: break-word;
+    }
+    pre .e { color: var(--red); }
+    pre .m { color: var(--muted); }
+    #banner { display: none; margin-bottom: 12px; padding: 8px 12px; border-radius: 6px; color: var(--red); border: 1px solid var(--red); }
+    #banner.show { display: block; }
+</style>
+</head>
+<body>
+<main>
+    <header>
+        <h1>pdd</h1>
+        <span class="muted" id="summary"></span>
+    </header>
+    <div id="banner"></div>
+
+    <div class="panel table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th><th>Name</th><th>Status</th><th>PID</th>
+                    <th>CPU</th><th>Mem</th><th>Uptime</th><th id="err-head">Error</th><th></th>
+                </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+        </table>
+    </div>
+
+    <section id="logs" class="panel">
+        <div class="logs-head">
+            <strong id="logs-title"></strong>
+            <span class="live" id="live">connecting</span>
+            <button id="logs-clear">Clear</button>
+            <button id="logs-close">Close</button>
+        </div>
+        <pre id="log-body"></pre>
+    </section>
+</main>
+
+<script>
+const MAX_LOG_LINES = 2000;
+let processes = [];
+let selectedId = null;
+let stream = null;
+const busy = new Set();
+
+const $ = id => document.getElementById(id);
+
+function fmtMem(bytes) {
+    if (bytes == null) return "-";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + "KB";
+    return (bytes / 1024 / 1024).toFixed(1) + "MB";
+}
+
+function fmtUptime(ms) {
+    if (ms == null) return "-";
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return s + "s";
+    if (s < 3600) return Math.floor(s / 60) + "m";
+    if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+    return Math.floor(s / 86400) + "d " + Math.floor((s % 86400) / 3600) + "h";
+}
+
+function cell(text, cls) {
+    const td = document.createElement("td");
+    td.textContent = text;
+    if (cls) td.className = cls;
+    return td;
+}
+
+function actionButton(label, action, p) {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.disabled = busy.has(p.id);
+    b.onclick = e => { e.stopPropagation(); doAction(action, p.id); };
+    return b;
+}
+
+function render() {
+    const rows = $("rows");
+    rows.replaceChildren();
+    const anyError = processes.some(p => p.lastError);
+    $("err-head").style.display = anyError ? "" : "none";
+
+    const online = processes.filter(p => p.status === "online").length;
+    $("summary").textContent = processes.length
+        ? `${online}/${processes.length} online`
+        : "";
+
+    if (processes.length === 0) {
+        const tr = document.createElement("tr");
+        const td = cell("No processes. Start one with pd start.", "empty muted");
+        td.colSpan = 9;
+        tr.appendChild(td);
+        rows.appendChild(tr);
+        return;
+    }
+
+    for (const p of processes) {
+        const running = p.status === "online";
+        const tr = document.createElement("tr");
+        if (p.id === selectedId) tr.className = "selected";
+        tr.onclick = () => openLogs(p.id);
+
+        tr.appendChild(cell(p.id, "num"));
+        tr.appendChild(cell(p.name));
+        tr.appendChild(cell(p.status, `status s-${p.status}`));
+        tr.appendChild(cell(running ? (p.pid ?? p.monit?.pid ?? "-") : "-", "num"));
+        tr.appendChild(cell(running && p.monit ? p.monit.cpu.toFixed(1) + "%" : "-", "num"));
+        tr.appendChild(cell(running && p.monit ? fmtMem(p.monit.memory) : "-", "num"));
+        tr.appendChild(cell(running && p.monit ? fmtUptime(p.monit.elapsed) : "-", "num"));
+        if (anyError) tr.appendChild(cell(p.lastError ?? "", "err-text"));
+
+        const actions = document.createElement("td");
+        actions.className = "actions";
+        if (running || p.status === "starting") {
+            actions.appendChild(actionButton("Restart", "restart", p));
+            actions.appendChild(actionButton("Stop", "stop", p));
+        } else {
+            actions.appendChild(actionButton("Start", "start", p));
+        }
+        tr.appendChild(actions);
+        rows.appendChild(tr);
+    }
+}
+
+function showBanner(msg) {
+    $("banner").textContent = msg;
+    $("banner").classList.toggle("show", !!msg);
+}
+
+async function refresh() {
+    try {
+        const res = await fetch("/list");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        processes = await res.json();
+        showBanner("");
+        render();
+    } catch (e) {
+        showBanner(`Can't reach pdd: ${e.message}`);
+    }
+}
+
+async function doAction(action, id) {
+    busy.add(id);
+    render();
+    try {
+        const res = await fetch(`/${action}/${id}`, { method: "POST" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const result = await res.json();
+        processes = result.processes;
+    } catch (e) {
+        showBanner(`${action} failed: ${e.message}`);
+    } finally {
+        busy.delete(id);
+        render();
+    }
+}
+
+// ── Logs ──────────────────────────────────────────────────────────────────
+
+function appendLog(text, cls) {
+    const body = $("log-body");
+    const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 40;
+    const span = document.createElement("span");
+    span.textContent = text;
+    if (cls) span.className = cls;
+    body.appendChild(span);
+    while (body.childNodes.length > MAX_LOG_LINES) body.removeChild(body.firstChild);
+    if (atBottom) body.scrollTop = body.scrollHeight;
+}
+
+// Run start/end markers written by process.ts get dimmed so runs are easy to tell apart.
+function appendHistory(blob, cls) {
+    for (const line of blob.split("\n")) {
+        if (!line) continue;
+        appendLog(line + "\n", /^-- Process \(\d+\) .+ at .+ --$/.test(line) ? "m" : cls);
+    }
+}
+
+async function openLogs(id) {
+    if (stream) stream.close();
+    selectedId = id;
+    render();
+
+    const p = processes.find(x => x.id === id);
+    $("logs-title").textContent = `${p?.name ?? id} logs`;
+    $("log-body").replaceChildren();
+    $("logs").classList.add("open");
+    setLive(false, "connecting");
+
+    try {
+        const res = await fetch(`/logs/${id}?runs=1`);
+        if (res.ok) {
+            const { out, err } = await res.json();
+            appendHistory(out, "");
+            appendHistory(err, "e");
+        }
+    } catch {}
+    if (selectedId !== id) return;
+
+    stream = new EventSource(`/logs/${id}/stream`);
+    stream.onopen = () => setLive(true, "live");
+    stream.onerror = () => setLive(false, "reconnecting");
+    stream.onmessage = ev => {
+        const msg = JSON.parse(ev.data);
+        appendLog(msg.line, msg.type === "err" ? "e" : "");
+    };
+    $("log-body").scrollTop = $("log-body").scrollHeight;
+}
+
+function setLive(on, text) {
+    $("live").textContent = text;
+    $("live").classList.toggle("on", on);
+}
+
+function closeLogs() {
+    if (stream) stream.close();
+    stream = null;
+    selectedId = null;
+    $("logs").classList.remove("open");
+    render();
+}
+
+$("logs-close").onclick = closeLogs;
+$("logs-clear").onclick = () => $("log-body").replaceChildren();
+
+// Poll every 2s while the tab is visible; refresh immediately when it comes back.
+refresh();
+setInterval(() => { if (!document.hidden) refresh(); }, 2000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+</script>
+</body>
+</html>

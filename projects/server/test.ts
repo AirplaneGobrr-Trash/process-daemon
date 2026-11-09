@@ -80,3 +80,36 @@ describe("respawn", () => {
         }
     });
 });
+
+describe("Process lifecycle", () => {
+    test("can start again after stop() kills the child with a signal", async () => {
+        // A child killed by SIGTERM ends with exitCode null and only signalCode set.
+        // start() must treat that as exited, not as still running.
+        const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "pdd-test-"));
+        await fs.writeFile(path.join(tmpDir, "run.sh"), "sleep 30\n");
+
+        const p = new processModule.Process(
+            { name: "sig-restart", cwd: tmpDir, script: "run.sh", interpreter: "bash" },
+            999,
+        );
+
+        try {
+            await p.start();
+            const firstPid = p.pid;
+            expect(p.status).toBe(Status.Online);
+
+            await p.stop();
+            expect(p.status).toBe(Status.Stopped);
+
+            await p.start();
+            expect(p.status).toBe(Status.Online);
+            expect(p.pid).not.toBe(firstPid);
+            expect(isAlive(p.pid!)).toBe(true);
+
+            await p.restart();
+            expect(p.status).toBe(Status.Online);
+        } finally {
+            await p.remove();
+        }
+    }, 15_000);
+});

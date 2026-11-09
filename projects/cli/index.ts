@@ -46,10 +46,13 @@ interface EcosystemFile {
     apps?: EcosystemApp[];
 }
 
-function normalizeApp(app: EcosystemApp): ProcessOptions {
+// The daemon runs from its own directory, so every cwd must be absolute by the
+// time it's sent. A relative (or missing) cwd in an ecosystem file is resolved
+// against the file's own directory, matching PM2, so the file stays portable.
+function normalizeApp(app: EcosystemApp, ecoDir: string): ProcessOptions {
     return {
         name: app.name,
-        cwd: app.cwd ?? process.cwd(),
+        cwd: path.resolve(ecoDir, app.cwd ?? "."),
         ...(app.script && { script: app.script }),
         ...(app.interpreter && { interpreter: app.interpreter }),
         ...((app.autorestart || app.restart) && { restart: true }),
@@ -72,7 +75,8 @@ async function loadEcosystemFile(filePath: string): Promise<ProcessOptions[]> {
     }
 
     const apps = Array.isArray(raw) ? raw : (raw.apps ?? []);
-    return apps.map(normalizeApp);
+    const ecoDir = path.dirname(resolved);
+    return apps.map(app => normalizeApp(app, ecoDir));
 }
 
 async function findEcosystemFile(): Promise<string | null> {
@@ -93,10 +97,14 @@ async function appendToEcosystemFile(filePath: string, opts: ProcessOptions): Pr
         if (!data.apps) data.apps = [];
     }
 
+    // Store cwd relative to the ecosystem file ("." when they're the same dir),
+    // so the file keeps working if the project is moved or cloned elsewhere.
+    const relCwd = path.relative(path.dirname(resolved), path.resolve(opts.cwd)) || ".";
+
     // Build PM2-compatible entry
     const entry: EcosystemApp = {
         name: opts.name,
-        cwd: opts.cwd,
+        cwd: relCwd,
         ...(opts.script && { script: opts.script }),
         ...(opts.interpreter && { interpreter: opts.interpreter }),
         ...(opts.restart && { autorestart: true }),
@@ -408,8 +416,9 @@ async function interactiveNew(): Promise<ProcessOptions | null> {
     const name = await p.text({ message: "Process name", validate: v => v?.trim() ? undefined : "Required" });
     if (p.isCancel(name)) { p.cancel("Cancelled."); return null; }
 
-    const cwd = await promptPath("Working directory", process.cwd());
-    if (cwd === null) { p.cancel("Cancelled."); return null; }
+    const cwdInput = await promptPath("Working directory", process.cwd());
+    if (cwdInput === null) { p.cancel("Cancelled."); return null; }
+    const cwd = path.resolve(cwdInput);
 
     const script = await promptPath("Script / entrypoint", ".", cwd);
     if (script === null) { p.cancel("Cancelled."); return null; }
@@ -575,7 +584,7 @@ program
             const env = parseEnvPairs((opts.env ?? []) as string[]);
             const config: ProcessOptions = {
                 name: opts.name,
-                cwd: opts.cwd,
+                cwd: path.resolve(opts.cwd),
                 ...(opts.script && { script: opts.script }),
                 ...(opts.interpreter && { interpreter: opts.interpreter }),
                 ...(opts.restart && { restart: true }),

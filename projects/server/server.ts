@@ -4,6 +4,9 @@ import { existsSync } from "fs";
 import proc from "./manager"
 import { isAlive } from "./process";
 import type { ProcessOptions } from "../types";
+// Inlined as a string at build time, so the compiled pdd binary carries the
+// dashboard with it and never reads it from disk.
+import dashboardHtml from "./dashboard.html" with { type: "text" };
 
 const app = express();
 app.use(express.json());
@@ -48,6 +51,12 @@ function asyncRoute<P = {}>(handler: (req: express.Request<P>, res: express.Resp
         });
     };
 }
+
+// Web dashboard: a single static page that only talks to the routes below
+// (/list polling, /start|stop|restart/:id, /logs/:id and its SSE stream).
+app.get("/", (_req, res) => {
+    res.type("html").send(dashboardHtml);
+});
 
 app.get("/list", asyncRoute(async (_req, res) => {
     res.json(await proc.list());
@@ -131,8 +140,11 @@ app.get("/logs/:getter/stream", (req, res) => {
     });
 });
 
-app.listen("3830", () => {
-    console.log("Running at :3830")
+// PDD_PORT is for running a second dev/test daemon next to the real one; the
+// CLI and SDK default to 3830.
+const port = Number(process.env.PDD_PORT) || 3830;
+app.listen(port, () => {
+    console.log(`Running at :${port} (dashboard: http://localhost:${port}/)`);
 });
 
 // Stop managed processes on the way down instead of leaving them running
