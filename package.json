@@ -18,6 +18,7 @@
     "build:sdk": "tsup",
     "build:server": "bun run build.ts",
     "build": "bun run build:sdk && bun run build:server",
+    "test": "bun test ./projects/server/test.ts",
     "release": "bun run release.ts",
     "link": "cd projects/client && bun link"
   },
@@ -36,6 +37,7 @@
     "bun.db": "^1.1.4",
     "commander": "^14.0.3",
     "express": "^5.2.1",
+    "picocolors": "^1.1.1",
     "pidusage": "^4.0.1"
   }
 }

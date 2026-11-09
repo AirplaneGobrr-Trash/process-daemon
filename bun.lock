@@ -12,6 +12,7 @@
         "bun.db": "^1.1.4",
         "commander": "^14.0.3",
         "express": "^5.2.1",
+        "picocolors": "^1.1.1",
         "pidusage": "^4.0.1",
       },
       "devDependencies": {

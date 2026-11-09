@@ -4,6 +4,7 @@ import { Command } from "commander";
 import { spawnSync } from "child_process";
 import { isAxiosError } from "axios";
 import * as p from "@clack/prompts";
+import pc from "picocolors";
 import path from "path";
 import readline from "node:readline";
 import { readdirSync, statSync } from "node:fs";
@@ -210,12 +211,11 @@ function fmtMem(bytes: number): string {
     return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
 }
 
-const COLOR = {
-    green: (s: string) => `\x1b[32m${s}\x1b[0m`,
-    red: (s: string) => `\x1b[31m${s}\x1b[0m`,
-    yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,
-    dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
-};
+// Forced on: callers already gate every use behind the relevant stream's own
+// isTTY check (stdout vs stderr), so picocolors' own auto-detection (which
+// only looks at stdout) would otherwise wrongly suppress color on a
+// stderr-bound string when stdout happens to be piped.
+const COLOR = pc.createColors(true);
 
 function colorStatus(s: string): string {
     if (!process.stdout.isTTY) return s;
@@ -223,6 +223,125 @@ function colorStatus(s: string): string {
     if (s === Status.Error) return COLOR.red(s);
     if (s === Status.Stopped || s === Status.Stopping) return COLOR.yellow(s);
     return s;
+}
+
+// Every run's start/end marker lines bracket that run's content within a
+// stream's raw log blob. Splitting on them turns the flat concatenated text
+// pd used to dump into one block per run, so a crash-restart cycle reads as
+// "this run did X then died" instead of two disjoint stdout/stderr walls the
+// reader has to cross-reference by timestamp.
+const RUN_MARKER = /^-- Process \(\d+\) (.+) at (.+) --$/;
+
+interface LogRun {
+    startTs?: string;
+    endTs?: string;
+    verb?: string; // undefined while the run is still live (no end marker yet)
+    lines: string[];
+}
+
+function parseLogRuns(blob: string): LogRun[] {
+    if (!blob) return [];
+    const lines = blob.split("\n");
+    if (lines[lines.length - 1] === "") lines.pop();
+
+    const runs: LogRun[] = [];
+    let current: LogRun | undefined;
+    for (const line of lines) {
+        const m = line.match(RUN_MARKER);
+        if (m) {
+            const [, verb, ts] = m;
+            if (verb === "started") {
+                current = { startTs: ts, lines: [] };
+                runs.push(current);
+            } else if (current) {
+                current.verb = verb;
+                current.endTs = ts;
+            }
+            continue;
+        }
+        current?.lines.push(line);
+    }
+    return runs;
+}
+
+interface CombinedRun {
+    startTs?: string;
+    endTs?: string;
+    verb?: string;
+    outLines: string[];
+    errLines: string[];
+}
+
+// out/err are always written together on every spawn (see process.ts's
+// start()), so the nth run parsed out of each blob is the same run.
+function combineLogRuns(out: string, err: string): CombinedRun[] {
+    const outRuns = parseLogRuns(out);
+    const errRuns = parseLogRuns(err);
+    const count = Math.max(outRuns.length, errRuns.length);
+    const combined: CombinedRun[] = [];
+    for (let i = 0; i < count; i++) {
+        const o = outRuns[i];
+        const e = errRuns[i];
+        combined.push({
+            startTs: o?.startTs ?? e?.startTs,
+            endTs: o?.endTs ?? e?.endTs,
+            verb: o?.verb ?? e?.verb,
+            outLines: o?.lines ?? [],
+            errLines: e?.lines ?? [],
+        });
+    }
+    return combined;
+}
+
+function fmtDuration(startTs: string, endTs: string): string {
+    const ms = new Date(endTs).getTime() - new Date(startTs).getTime();
+    if (ms < 1000) return `${ms}ms`;
+    return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function fmtRunHeader(run: CombinedRun, isTTY: boolean): string {
+    const time = run.startTs ? new Date(run.startTs).toLocaleTimeString() : "?";
+    let status: string;
+    if (!run.verb) status = isTTY ? COLOR.green("running") : "running";
+    else if (run.verb.startsWith("errored")) {
+        const text = `${run.verb} after ${fmtDuration(run.startTs!, run.endTs!)}`;
+        status = isTTY ? COLOR.red(text) : text;
+    } else if (run.verb === "exited") {
+        const text = `exited after ${fmtDuration(run.startTs!, run.endTs!)}`;
+        status = isTTY ? COLOR.dim(COLOR.green(text)) : text;
+    } else {
+        const text = `${run.verb} after ${fmtDuration(run.startTs!, run.endTs!)}`;
+        status = isTTY ? COLOR.dim(text) : text;
+    }
+    const dash = isTTY ? COLOR.dim("──") : "──";
+    return `${dash} ${time} → ${status} ${dash}`;
+}
+
+function printLogRuns(out: string, err: string, showOut: boolean, showErr: boolean): void {
+    const runs = combineLogRuns(out, err);
+    if (runs.length === 0) {
+        const stream = showOut ? process.stdout : process.stderr;
+        stream.write(stream.isTTY ? COLOR.dim("-- no logs --\n") : "-- no logs --\n");
+        return;
+    }
+
+    for (const run of runs) {
+        process.stdout.write(fmtRunHeader(run, process.stdout.isTTY) + "\n");
+
+        let printed = false;
+        if (showOut) {
+            for (const line of run.outLines) process.stdout.write(line + "\n");
+            printed ||= run.outLines.length > 0;
+        }
+        if (showErr) {
+            for (const line of run.errLines) {
+                process.stderr.write((process.stderr.isTTY ? COLOR.red(line) : line) + "\n");
+            }
+            printed ||= run.errLines.length > 0;
+        }
+        if (!printed) continue;
+        process.stdout.write("\n");
+    }
 }
 
 function printTable(procs: ProcessInfo[], highlight?: Set<number>): void {
@@ -521,28 +640,32 @@ program
     });
 
 program
-    .command("logs <getter>")
-    .description("Show logs for a process")
+    .command("logs <getter> [runs]")
+    .description("Show logs for a process, grouped per run (default: last 1 run)")
     .option("--out", "Show stdout only")
     .option("--err", "Show stderr only")
-    .option("--runs <n>", "Number of past runs to show (default: 3)", Number)
+    .option("--runs <n>", "Number of past runs to show (overrides the positional arg)", Number)
     .option("-f, --follow", "Stream live logs after showing history, until Ctrl+C")
-    .action(async (getter: string, opts) => {
+    .action(async (getter: string, runsArg: string | undefined, opts) => {
         await ensureDaemon();
-        const runs: number = opts.runs ?? 3;
+
+        let runs = 1;
+        if (opts.runs !== undefined) {
+            runs = opts.runs;
+        } else if (runsArg !== undefined) {
+            runs = Number(runsArg);
+        }
+        if (!Number.isInteger(runs) || runs < 1) {
+            process.stderr.write(`error: invalid run count "${opts.runs ?? runsArg}"\n`);
+            process.exit(1);
+        }
+
         const { out, err } = await client.logs(getter, { runs });
 
         const showOut = !opts.err;
         const showErr = !opts.out;
 
-        if (showOut && out) {
-            if (showErr) process.stdout.write(process.stdout.isTTY ? COLOR.dim("── stdout ──\n") : "── stdout ──\n");
-            process.stdout.write(out.endsWith("\n") ? out : out + "\n");
-        }
-        if (showErr && err) {
-            if (showOut) process.stderr.write(process.stdout.isTTY ? COLOR.dim("── stderr ──\n") : "── stderr ──\n");
-            process.stderr.write(err.endsWith("\n") ? err : err + "\n");
-        }
+        printLogRuns(out, err, showOut, showErr);
 
         if (!opts.follow) return;
 
@@ -554,7 +677,7 @@ program
         });
         await client.streamLogs(getter, msg => {
             if (msg.type === "out" && showOut) process.stdout.write(msg.line);
-            if (msg.type === "err" && showErr) process.stderr.write(msg.line);
+            if (msg.type === "err" && showErr) process.stderr.write(process.stderr.isTTY ? COLOR.red(msg.line) : msg.line);
         }, controller.signal).catch(e => {
             if (isAxiosError(e) && e.code === "ERR_CANCELED") return;
             throw e;

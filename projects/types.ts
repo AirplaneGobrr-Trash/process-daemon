@@ -35,6 +35,9 @@ export interface ProcessInfo {
     process?: Process;
     id: number;
     name: string;
+    // Captured at spawn time, independent of `monit` (which only updates once
+    // pidusage successfully polls). Always reflects the real pid of the live child.
+    pid?: number;
     monit?: Stat;
     lastAction?: Actions;
     lastError?: string;

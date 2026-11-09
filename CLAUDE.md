@@ -74,7 +74,8 @@ interface ProcessInfo {
     name: string;
     status: Status;        // "starting" | "online" | "stopping" | "stopped" | "error"
     lastAction?: Actions;
-    lastError?: string;    // set on pre-flight failure or max restarts exceeded
+    lastError?: string;    // set on pre-flight failure, max restarts exceeded, or a failed pid reclaim on respawn
+    pid?: number;          // captured at spawn time, independent of monit
     monit?: Stat;          // cpu, memory, pid, elapsed - populated by list()
     logFiles?: string[];   // base names of all log file pairs, persisted across daemon restarts
 }
@@ -94,7 +95,15 @@ interface ActionResult {
 - **`lastError` clears on successful spawn**: set to `undefined` when `status` transitions to `Online`.
 - **Pre-flight checks set `Status.Error`**: missing interpreter/cwd/script sets error status immediately instead of getting stuck on `Starting`.
 - **Routes are explicit, not dynamic**: an earlier version auto-generated routes by iterating `proc` object keys; replaced with an explicit list to avoid accidentally exposing `save`/`respawn`.
-- **Processes.json is recovered gracefully**: `respawn()` wraps JSON parse in try/catch and defaults to `[]` on corrupt/empty file.
+- **Processes.json is recovered gracefully**: `respawn()` wraps JSON parse in try/catch and defaults to `[]` on corrupt/empty file, but logs loudly to stderr first since this means total loss of process tracking, so it's visible in `journalctl` instead of silently eating every managed process.
+- **`save()` writes atomically**: writes to `processes.json.tmp` in the same directory, then `rename()`s it over `processes.json`. `rename()` is atomic on the same filesystem, so a daemon kill (OOM, `kill -9`, host reboot) mid-write can never leave a truncated/corrupt file behind.
+- **`killOrphan()` escalates to SIGKILL**: after the existing 10x200ms SIGTERM wait, if the pid is still alive it sends SIGKILL to the process group and waits again, returning whether the pid is actually dead by the end. `Process.stop()` mirrors this: SIGTERM, wait up to 5s via `Promise.race` against `spawned.exited`, then SIGKILL and wait up to 2s more if it's still alive. Neither ever hangs indefinitely on an unresponsive child. This deliberately doesn't change the process-group (`-pid`) targeting itself; a script that further detaches its own grandchild still escapes it, a known limitation out of scope here.
+- **`respawn()` refuses to double-spawn over an unreclaimed pid**: if `killOrphan()` reports the old pid is still alive after SIGKILL (e.g. it's in an uninterruptible state, or belongs to a process we don't have permission to signal), the entry is left in `Status.Error` with `lastError` set to `could not reclaim pid <n>, refusing to double-spawn` instead of spawning a replacement that might collide with the still-running orphan (e.g. over the same port). See "Troubleshooting" below.
+- **`pid` is captured independently of `monit`**: `Process.pid` is set from `Bun.spawn()`'s return value the moment it resolves, not derived from the async, pidusage-populated `monit.pid`. This lets `processes.json` always serialize the real pid, even for a process whose first resource-usage poll hasn't completed (or never succeeds) yet. `respawn()` falls back to the old `monit.pid` field when reading a `processes.json` written before this field existed.
+- **Every spawn persists, not just route-driven actions**: `Process` emits a `"spawned"` event every time `start()` successfully spawns a child, including the internal auto-restart path (`onExit`'s `setTimeout(() => that.start(true), ...)`), which previously never notified `manager.ts`. `createProcess()` subscribes to `"spawned"` and calls `save()`, so `processes.json` always reflects the live pid across auto-restarts that never touched an HTTP route.
+- **`start()` refuses to double-spawn over its own still-running child**: the guard used to check `this.spawned && !this.spawned.exited`, but `exited` is a `Promise` (always truthy), so the check never actually fired; it now checks `this.spawned.exitCode === null`. A `_starting` flag, set synchronously before the interpreter/cwd/script preflight `await`s, closes the remaining window where a second call (a manual restart racing a pending auto-restart `setTimeout`) could land before `this.spawned` is assigned and slip past that guard too. Without both, two overlapping `start()` calls (e.g. from a mass-SIGTERM restart storm, like every managed process dying at once from `pkill bun` since they're all spawned via the `bun` interpreter) could spawn a second child on top of a healthy first one; whichever child's `onExit` fires afterward unconditionally overwrites `status`/`lastError`/`restartCount`, leaving the daemon reporting a stale/errored state for a process whose real child is alive and fine.
+- **Log write failures are attributed to their process, not left uncaught**: `outStream`/`errStream` in `start()` have an `"error"` listener that logs via `console.error` tagged with the process id. Without it, a write failure (e.g. `ENOSPC`) surfaces as a bare uncaught exception on the daemon's top-level handler with no indication of which process's logs failed.
+- **Singleton guard via pidfile**: `server.ts` checks `./pdd.pid` (`/var/lib/pdd/pdd.pid` in production, since that's the service's `WorkingDirectory`) before binding port 3830. If it exists and that pid is still alive, the daemon refuses to start instead of racing another live instance over `processes.json` and the port. The pidfile is removed on graceful shutdown so a later, unrelated process reusing that pid can't falsely trip the check.
 - **CLI auto-starts the daemon**: every `pd` command calls `ensureDaemon()` first; on `ECONNREFUSED` it writes `/var/lib/pdd/env` with the current bun PATH, then runs `sudo systemctl start pdd` and polls until `:3830` responds.
 - **Interpreter is resolved to an absolute path**: `resolveInterpreter()` in `process.ts` tries `Bun.which` first, then falls back to known install locations (`~/.bun/bin`, `/usr/local/bin`, `/usr/bin`, `/opt/homebrew/bin`). The resolved path is passed directly to `Bun.spawn`, so systemd's stripped PATH never causes a "No interpreter" error.
 - **Bun PATH is written by the CLI, not hardcoded in the service**: `ensureDaemon()` writes `PATH=<bun-dir>:...` to `/var/lib/pdd/env` before starting the service. The service file uses `EnvironmentFile=-/var/lib/pdd/env` (the `-` means the file is optional, so cold starts without a prior `pd` invocation still work via `resolveInterpreter`'s fallback).
@@ -147,6 +156,10 @@ await client.start({
 
 From the CLI: `pd start --name my-app --cwd /path/to/app --env NODE_ENV=production PORT=8080`.
 
+## Troubleshooting
+
+- **`lastError: could not reclaim pid <n>, refusing to double-spawn`**: seen on daemon startup (`respawn()`) when a process from a previous run was still alive under its last known pid and survived both a SIGTERM and a follow-up SIGKILL. The daemon refuses to spawn a replacement since the old one might still hold the port or other resources. The process is left in `Status.Error` for manual intervention: confirm whether pid `<n>` is still running (`ps -p <n>`), deal with it manually if so (it's likely wedged in an uninterruptible state, or owned by a different user), then `pd restart <getter>` once it's actually gone.
+
 ## Intentionally excluded
 
 - No authentication (local daemon, trusted network assumed)
@@ -165,6 +178,7 @@ bun run build:sdk    # SDK only → dist/ (ESM + CJS + .d.ts)
 bun run build:server # all binaries → pdd-linux-{x64,arm64}, pd-linux-{x64,arm64}
 bun run server       # run daemon in dev (no compile)
 bun run cli -- <args> # run CLI in dev (no compile), e.g. bun run cli -- list
+bun run test         # runs projects/server/test.ts (bun:test)
 ```
 
 ## Release

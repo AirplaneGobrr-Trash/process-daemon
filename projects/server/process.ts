@@ -30,18 +30,31 @@ export function isAlive(pid: number): boolean {
 }
 
 // Sends the whole process group a SIGTERM (mirroring Process.stop()) and waits
-// briefly for it to die. Used on respawn to clean up a child left running from
-// before a daemon crash, so we don't spawn a duplicate on top of it.
-export async function killOrphan(pid: number): Promise<void> {
-    if (!isAlive(pid)) return;
+// briefly for it to die, escalating to SIGKILL if it ignores the SIGTERM. Used
+// on respawn to clean up a child left running from before a daemon crash, so
+// we don't spawn a duplicate on top of it. Returns whether the pid is actually
+// dead by the end, so callers can refuse to double-spawn if it isn't.
+export async function killOrphan(pid: number): Promise<boolean> {
+    if (!isAlive(pid)) return true;
     try {
         process.kill(-pid, "SIGTERM");
     } catch {
-        return;
+        // Group already gone, or we lack permission to signal it.
     }
     for (let i = 0; i < 10 && isAlive(pid); i++) {
         await Bun.sleep(200);
     }
+    if (!isAlive(pid)) return true;
+
+    try {
+        process.kill(-pid, "SIGKILL");
+    } catch {
+        // Group already gone, or we lack permission to signal it.
+    }
+    for (let i = 0; i < 10 && isAlive(pid); i++) {
+        await Bun.sleep(200);
+    }
+    return !isAlive(pid);
 }
 
 function resolveInterpreter(name: string): string | null {
@@ -63,6 +76,11 @@ export class Process extends EventEmitter {
     public id: number;
     private spawned?: Bun.Subprocess;
 
+    // Captured straight from Bun.spawn(), independent of `monit` (which is only
+    // populated once pidusage successfully runs). Lets manager.save() persist the
+    // real pid even before the first resource-usage poll completes.
+    public pid?: number;
+
     public lastExit?: number;
     public lastCode?: number | null;
     public lastError?: string;
@@ -77,6 +95,12 @@ export class Process extends EventEmitter {
     public restartCount: number = 0;
 
     private _stopping = false;
+    // Set synchronously at the top of start(), before any await, so a second
+    // call landing during the preflight checks below (interpreter/cwd/script)
+    // can't slip past the this.spawned guard, which isn't set until after those
+    // awaits resolve. Without this, a manual start/restart racing a pending
+    // auto-restart setTimeout could both pass the guard and double-spawn.
+    private _starting = false;
     private stableTimer?: ReturnType<typeof setTimeout>;
 
     public monit?: Stat;
@@ -126,7 +150,11 @@ export class Process extends EventEmitter {
     async start(isAutoRestart = false) {
         if (this.removed) return;
         if (isAutoRestart && this._stopping) return;
-        if (this.spawned && !this.spawned.exited) return;
+        // this.spawned.exited is a Promise, always truthy, so checking it directly
+        // never detects a still-running child; exitCode is null until it exits.
+        if (this.spawned && this.spawned.exitCode === null) return;
+        if (this._starting) return;
+        this._starting = true;
         if (!isAutoRestart) {
             this.restartCount = 0;
             this._stopping = false;
@@ -139,12 +167,14 @@ export class Process extends EventEmitter {
         if (!interpreterPath) {
             this.lastError = "No interpreter";
             this.status = Status.Error;
+            this._starting = false;
             return;
         }
 
         if (!await checkExists(this.info.cwd)) {
             this.lastError = "No CWD Exists";
             this.status = Status.Error;
+            this._starting = false;
             return;
         }
 
@@ -153,6 +183,7 @@ export class Process extends EventEmitter {
             if (!await Bun.file(scriptPath).exists()) {
                 this.lastError = "No Script Exists";
                 this.status = Status.Error;
+                this._starting = false;
                 return;
             }
         }
@@ -168,6 +199,10 @@ export class Process extends EventEmitter {
 
         const outStream = createWriteStream(outPath, { flags: "a" });
         const errStream = createWriteStream(errPath, { flags: "a" });
+        // Without a listener, a write failure (e.g. ENOSPC) throws as an uncaught
+        // exception instead of being attributed to this process.
+        outStream.on("error", err => console.error(`[pdd] log write failed for process ${that.id}:`, err));
+        errStream.on("error", err => console.error(`[pdd] log write failed for process ${that.id}:`, err));
 
         const proc = Bun.spawn({
             cmd: [interpreterPath, this.info.script],
@@ -205,6 +240,13 @@ export class Process extends EventEmitter {
         this.status = Status.Online;
         this.lastError = undefined;
         this.spawned = proc;
+        this.pid = proc.pid;
+        this._starting = false;
+
+        // Notify manager (or any other listener) that a new child is live so it can
+        // persist the fresh pid, including on the internal auto-restart path below
+        // which never goes through an HTTP route.
+        this.emit("spawned");
 
         // Consider the restart storm over once the process has stayed up for a while,
         // so a crash long after a healthy run doesn't inherit the old restart count.
@@ -267,17 +309,35 @@ export class Process extends EventEmitter {
 
         this._stopping = true;
         if (this.spawned) {
+            const spawned = this.spawned;
             // The child is spawned detached (its own process group), so a plain
             // spawned.kill() only signals it, not any subprocess it forked internally
             // (e.g. "npm start" wrapping a real server). Signal the whole group instead
             // by targeting the negative pid, so wrapper-spawned children die with it.
+            // Note: a script that further detaches its own grandchild (setsid again)
+            // escapes this group and won't be caught here; known limitation, out of scope.
             try {
-                process.kill(-this.spawned.pid, "SIGTERM");
+                process.kill(-spawned.pid, "SIGTERM");
             } catch {
                 // Group already gone
             }
+
+            const exitedInTime = await Promise.race([
+                spawned.exited.then(() => true),
+                Bun.sleep(5000).then(() => false),
+            ]);
+
+            // SIGTERM went unhandled (or was ignored): escalate so stop() never hangs
+            // indefinitely on an unresponsive child.
+            if (!exitedInTime && isAlive(spawned.pid)) {
+                try {
+                    process.kill(-spawned.pid, "SIGKILL");
+                } catch {
+                    // Group already gone
+                }
+                await Promise.race([spawned.exited, Bun.sleep(2000)]);
+            }
         }
-        await this.spawned?.exited;
 
         this.status = Status.Stopped;
     }

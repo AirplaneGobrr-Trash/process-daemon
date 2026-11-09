@@ -1,9 +1,29 @@
 import express from "express";
+import fs from "fs/promises";
+import { existsSync } from "fs";
 import proc from "./manager"
+import { isAlive } from "./process";
 import type { ProcessOptions } from "../types";
 
 const app = express();
 app.use(express.json());
+
+const pidFilePath = "./pdd.pid";
+
+// Refuses to start if another live instance already holds this pidfile, instead of
+// silently racing it over processes.json and the port.
+async function ensureSingleton() {
+    if (existsSync(pidFilePath)) {
+        const existingPid = Number((await fs.readFile(pidFilePath, "utf8")).trim());
+        if (existingPid && isAlive(existingPid)) {
+            console.error(`[pdd] another instance is already running (pid ${existingPid}), refusing to start`);
+            process.exit(1);
+        }
+    }
+    await fs.writeFile(pidFilePath, String(process.pid));
+}
+
+await ensureSingleton();
 
 await proc.respawn();
 
@@ -131,6 +151,9 @@ async function shutdown(signal: string) {
     } catch (err) {
         console.error("[pdd] error during shutdown:", err);
     }
+    // Clean up so a future pid reused by an unrelated process doesn't fool the
+    // next startup's singleton check into thinking it's still us.
+    await fs.unlink(pidFilePath).catch(() => {});
     process.exit(0);
 }
 
