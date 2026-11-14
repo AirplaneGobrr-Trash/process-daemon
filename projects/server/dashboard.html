@@ -63,6 +63,21 @@
     }
     pre .e { color: var(--red); }
     pre .m { color: var(--muted); }
+    #config { margin-top: 16px; display: none; }
+    #config.open { display: block; }
+    .cfg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; padding: 12px; }
+    .cfg-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+    .cfg-grid label.check { flex-direction: row; align-items: center; gap: 8px; color: var(--text); font-size: 14px; }
+    .cfg-grid .wide { grid-column: 1 / -1; }
+    input[type=text], input[type=number], textarea {
+        font: inherit; color: var(--text); background: var(--log-bg); border: 1px solid var(--border);
+        border-radius: 5px; padding: 6px 8px; width: 100%;
+    }
+    textarea { font: 12px/1.5 ui-monospace, "SF Mono", Menlo, monospace; min-height: 90px; resize: vertical; }
+    input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+    .cfg-foot { display: flex; align-items: center; gap: 10px; padding: 0 12px 12px; }
+    .cfg-foot .muted { flex: 1; font-size: 12px; }
+    #cfg-error { color: var(--red); font-size: 12px; }
     #banner { display: none; margin-bottom: 12px; padding: 8px 12px; border-radius: 6px; color: var(--red); border: 1px solid var(--red); }
     #banner.show { display: block; }
 </style>
@@ -87,6 +102,29 @@
         </table>
     </div>
 
+    <section id="config" class="panel">
+        <div class="logs-head">
+            <strong id="cfg-title"></strong>
+            <button type="button" id="cfg-close">Close</button>
+        </div>
+        <form id="cfg-form">
+            <div class="cfg-grid">
+                <label>Name<input type="text" name="name" required></label>
+                <label>Working directory<input type="text" name="cwd" required></label>
+                <label>Script<input type="text" name="script" placeholder="."></label>
+                <label>Interpreter<input type="text" name="interpreter" placeholder="bun"></label>
+                <label class="check"><input type="checkbox" name="restart"> Auto-restart on crash</label>
+                <label>Max restarts<input type="number" name="maxRestarts" min="0" step="1" placeholder="5"></label>
+                <label class="wide">Environment (one KEY=VALUE per line)<textarea name="env" spellcheck="false"></textarea></label>
+            </div>
+            <div class="cfg-foot">
+                <span class="muted">Saving restarts the process if it's running.</span>
+                <span id="cfg-error"></span>
+                <button type="submit" id="cfg-save">Save</button>
+            </div>
+        </form>
+    </section>
+
     <section id="logs" class="panel">
         <div class="logs-head">
             <strong id="logs-title"></strong>
@@ -99,6 +137,42 @@
 </main>
 
 <script>
+// API auth: every call goes through this fetch wrapper, which attaches the
+// pdd token (kept in localStorage) and asks for it once on the first 401.
+// EventSource can't send headers, so the log stream passes it as ?token=.
+const TOKEN_KEY = "pdd-token";
+function getToken() {
+    try { return localStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; }
+}
+function setToken(t) {
+    try { localStorage.setItem(TOKEN_KEY, t); } catch {}
+}
+const rawFetch = window.fetch.bind(window);
+let tokenDeclined = false;
+window.fetch = async (url, opts = {}) => {
+    const send = () => {
+        const headers = new Headers(opts.headers || {});
+        const t = getToken();
+        if (t) headers.set("Authorization", `Bearer ${t}`);
+        return rawFetch(url, { ...opts, headers });
+    };
+    let res = await send();
+    if (res.status === 401 && !tokenDeclined) {
+        const t = window.prompt("pdd API token (run `pd auth token` on the server):");
+        if (t && t.trim()) {
+            setToken(t.trim());
+            res = await send();
+        } else {
+            tokenDeclined = true;
+        }
+    }
+    return res;
+};
+function withToken(url) {
+    const t = getToken();
+    return t ? `${url}${url.includes("?") ? "&" : "?"}token=${encodeURIComponent(t)}` : url;
+}
+
 const MAX_LOG_LINES = 2000;
 let processes = [];
 let selectedId = null;
@@ -174,6 +248,10 @@ function render() {
 
         const actions = document.createElement("td");
         actions.className = "actions";
+        const edit = document.createElement("button");
+        edit.textContent = "Edit";
+        edit.onclick = e => { e.stopPropagation(); openConfig(p.id); };
+        actions.appendChild(edit);
         if (running || p.status === "starting") {
             actions.appendChild(actionButton("Restart", "restart", p));
             actions.appendChild(actionButton("Stop", "stop", p));
@@ -218,6 +296,91 @@ async function doAction(action, id) {
     }
 }
 
+// ── Config ──────────────────────────────────────────────────────────────
+
+let configId = null;
+
+function openConfig(id) {
+    const p = processes.find(x => x.id === id);
+    if (!p) return;
+    configId = id;
+    const o = p.startOptions ?? {};
+    const f = $("cfg-form").elements;
+    $("cfg-title").textContent = `${p.name} config`;
+    f.name.value = o.name ?? p.name;
+    f.cwd.value = o.cwd ?? "";
+    f.script.value = o.script ?? "";
+    f.interpreter.value = o.interpreter ?? "";
+    f.restart.checked = !!o.restart;
+    f.maxRestarts.value = o.maxRestarts ?? "";
+    f.env.value = Object.entries(o.env ?? {}).map(([k, v]) => `${k}=${v}`).join("\n");
+    $("cfg-error").textContent = "";
+    $("config").classList.add("open");
+    $("config").scrollIntoView({ block: "nearest" });
+}
+
+function closeConfig() {
+    configId = null;
+    $("config").classList.remove("open");
+}
+
+function parseEnv(text) {
+    const env = {};
+    for (const raw of text.split("\n")) {
+        const line = raw.trim();
+        if (!line || line.startsWith("#")) continue;
+        const eq = line.indexOf("=");
+        if (eq <= 0) throw new Error(`invalid env line "${line}" (expected KEY=VALUE)`);
+        env[line.slice(0, eq).trim()] = line.slice(eq + 1);
+    }
+    return env;
+}
+
+$("cfg-form").onsubmit = async e => {
+    e.preventDefault();
+    if (configId == null) return;
+    const f = $("cfg-form").elements;
+    let body;
+    try {
+        body = {
+            name: f.name.value.trim(),
+            cwd: f.cwd.value.trim(),
+            script: f.script.value.trim(),
+            interpreter: f.interpreter.value.trim(),
+            restart: f.restart.checked,
+            env: parseEnv(f.env.value),
+        };
+        if (f.maxRestarts.value !== "") body.maxRestarts = Number(f.maxRestarts.value);
+    } catch (err) {
+        $("cfg-error").textContent = err.message;
+        return;
+    }
+    const id = configId;
+    $("cfg-save").disabled = true;
+    $("cfg-error").textContent = "";
+    busy.add(id);
+    render();
+    try {
+        const res = await fetch(`/config/${id}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+        processes = data.processes;
+        closeConfig();
+    } catch (err) {
+        $("cfg-error").textContent = `Save failed: ${err.message}`;
+    } finally {
+        busy.delete(id);
+        $("cfg-save").disabled = false;
+        render();
+    }
+};
+
+$("cfg-close").onclick = closeConfig;
+
 // ── Logs ──────────────────────────────────────────────────────────────────
 
 function appendLog(text, cls) {
@@ -260,7 +423,7 @@ async function openLogs(id) {
     } catch {}
     if (selectedId !== id) return;
 
-    stream = new EventSource(`/logs/${id}/stream`);
+    stream = new EventSource(withToken(`/logs/${id}/stream`));
     stream.onopen = () => setLive(true, "live");
     stream.onerror = () => setLive(false, "reconnecting");
     stream.onmessage = ev => {

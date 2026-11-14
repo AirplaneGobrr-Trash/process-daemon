@@ -1,5 +1,6 @@
 # Custom
 processes.json
+config.json
 pd*-*-*
 
 # Logs

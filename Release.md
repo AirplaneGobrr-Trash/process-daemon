@@ -1,11 +1,15 @@
-title: Version 1.3.0
-version: dev-1.3.0
-- New web dashboard at `http://<host>:3830/`: live process table (status, PID, CPU, memory, uptime, errors), start/stop/restart buttons, and click-a-row live logs. Built into `pdd`, no extra setup or dependencies.
-- Fix processes getting stuck: after `pd stop` (or the stop half of `pd restart`), `pd start` could silently do nothing, so the process only came back after `pd rm` and adding it again. Signal-killed children are now correctly detected as exited.
-- Fix double-spawns when a manual start/restart overlapped a pending auto-restart, which could leave an untracked copy running and holding the port.
-- `pd stop` no longer hangs on a child that ignores SIGTERM: it escalates to SIGKILL on the whole process group after 5s. Orphan cleanup on daemon startup does the same.
-- The daemon now persists each process's real pid on every spawn (including auto-restarts) and refuses to double-spawn on startup if an old pid can't be reclaimed.
-- `processes.json` is written atomically, so a crash mid-save can no longer corrupt it.
-- `pdd` refuses to start if another instance is already running.
-- Ecosystem files now use paths relative to the file itself: a relative or missing `cwd` resolves against the ecosystem file's directory, and saving writes `cwd` relative to it. `--cwd` and the interactive prompt are resolved to absolute paths too, so relative paths no longer break.
-- `pd logs` groups output per run with a header showing when it started and how it ended, defaults to the last run, and accepts the count as a positional arg (`pd logs api 3`).
+title: Version 1.4.0
+version: dev-1.4.0
+**Breaking: the API now requires a token and listens on 127.0.0.1 by default.** Local use (`pd`, the SDK on the same machine) keeps working with no changes, since the token is read automatically from `/var/lib/pdd/config.json`. Anything calling pdd from another machine needs `pd server public` on the daemon and the token from `pd auth token`.
+- Git deploys: `pd start --name api --cwd /srv/api --git <repo> --branch main --build "bun install"` clones, builds and starts in one step. `pd deploy <name|all>` fetches the branch, hard-resets to it, runs the build commands, and restarts the process if the commit changed (`-f` to force, `-v` for full output). A failed build rolls back to the previous commit and leaves the running app alone. `pd ls` shows a COMMIT column for git-backed processes.
+- `pd deploy <name>` on a process whose folder is already a git checkout picks up its origin URL and branch automatically (it refuses if there are uncommitted changes, unless `-f`).
+- Ecosystem files accept `repo`, `branch` and `build` (or PM2's `post_update`) per app.
+- API auth: `pd auth token | status | enable | disable | rotate`.
+- Listen address: `pd server local` (127.0.0.1) or `pd server public` (0.0.0.0), switched live without restarting the daemon.
+- LAN discovery: `pd discover` lists pdd daemons on the local network. Daemons answer only while public, and `pd server broadcast off` hides them.
+- `pd config`: interactive menu for auth, listen address, discovery and the token.
+- Edit a process's settings in place (name, cwd, script, interpreter, restart, env, git) from the dashboard's Edit form or `POST /config/:getter`, without removing and re-adding it.
+- The dashboard asks for the API token once and remembers it in the browser.
+- Fix every process coming back stopped after the daemon restarts (`systemctl restart pdd`, `pd update`). Processes that were running before now start again.
+- Fix the `url.parse() DeprecationWarning` printed on every `pd` command. The SDK now uses native `fetch` and no longer depends on axios.
+- SDK: `new ProcClient(url, { token })`, `deploy()`, `discover()`, and the daemon settings calls. The default URL is now `http://127.0.0.1:3830`.

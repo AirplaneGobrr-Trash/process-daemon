@@ -2,14 +2,13 @@
 
 import { Command } from "commander";
 import { spawnSync } from "child_process";
-import { isAxiosError } from "axios";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import path from "path";
 import readline from "node:readline";
 import { readdirSync, statSync } from "node:fs";
-import { ProcClient } from "../client/index";
-import { Status, type ActionResult, type ProcessInfo, type ProcessOptions } from "../types";
+import { ProcClient, ProcClientError, discover, isConnectionRefused, readLocalToken, localConfigPath } from "../client/index";
+import { Status, type ActionResult, type DaemonConfig, type DeployResult, type ProcessInfo, type ProcessOptions } from "../types";
 import {
     CURRENT_VERSION,
     compareVersions,
@@ -40,6 +39,18 @@ interface EcosystemApp {
     restart?: boolean;
     maxRestarts?: number;
     env?: Record<string, string>;
+    // git deploys
+    repo?: string;
+    branch?: string;
+    build?: string[] | string;
+    // PM2's name for commands run after `pm2 pull`
+    post_update?: string[];
+}
+
+function toCommandList(v: string[] | string | undefined): string[] | undefined {
+    if (v === undefined) return undefined;
+    const list = (Array.isArray(v) ? v : [v]).map(c => c.trim()).filter(Boolean);
+    return list.length ? list : undefined;
 }
 
 interface EcosystemFile {
@@ -60,6 +71,8 @@ function normalizeApp(app: EcosystemApp, ecoDir: string): ProcessOptions {
             maxRestarts: app.max_restarts ?? app.maxRestarts,
         }),
         ...(app.env && { env: app.env }),
+        ...(app.repo && { git: { repo: app.repo, ...(app.branch && { branch: app.branch }) } }),
+        ...(toCommandList(app.build ?? app.post_update) && { build: toCommandList(app.build ?? app.post_update) }),
     };
 }
 
@@ -110,6 +123,8 @@ async function appendToEcosystemFile(filePath: string, opts: ProcessOptions): Pr
         ...(opts.restart && { autorestart: true }),
         ...(opts.maxRestarts !== undefined && { max_restarts: opts.maxRestarts }),
         ...(opts.env && { env: opts.env }),
+        ...(opts.git && { repo: opts.git.repo, ...(opts.git.branch && { branch: opts.git.branch }) }),
+        ...(opts.build?.length && { build: opts.build }),
     };
 
     (data.apps ??= []).push(entry);
@@ -178,7 +193,11 @@ async function ensureDaemon(): Promise<void> {
         await client.list();
         return;
     } catch (e) {
-        if (!isAxiosError(e) || e.code !== "ECONNREFUSED") throw e;
+        if (e instanceof ProcClientError && e.status === 401) {
+            process.stderr.write(`error: pdd rejected the API token\n  → pd reads it from ${localConfigPath()}; check that file is readable by you\n`);
+            process.exit(1);
+        }
+        if (!isConnectionRefused(e)) throw e;
     }
 
     const bunPath = Bun.which("bun");
@@ -370,13 +389,17 @@ function printTable(procs: ProcessInfo[], highlight?: Set<number>): void {
         mem: p.monit ? fmtMem(p.monit.memory) : "-",
         uptime: p.monit ? fmtUptime(p.monit.elapsed) : "-",
         pid: p.monit ? String(p.monit.pid) : "-",
+        commit: p.commit ? p.commit.slice(0, 7) : "-",
         error: p.lastError ?? "-",
     }));
 
-    const headers = { marker: "", id: "ID", name: "NAME", status: "STATUS", cpu: "CPU", mem: "MEM", uptime: "UPTIME", pid: "PID", error: "ERROR" };
+    // Like ERROR, only shown when at least one process is git-backed.
+    const hasCommits = procs.some(p => p.commit);
+    const headers = { marker: "", id: "ID", name: "NAME", status: "STATUS", cpu: "CPU", mem: "MEM", uptime: "UPTIME", pid: "PID", commit: "COMMIT", error: "ERROR" };
     const baseCols = ["id", "name", "status", "cpu", "mem", "uptime", "pid"] as const;
     const withMarker = showMarker ? ["marker", ...baseCols] : baseCols as readonly string[];
-    const cols = hasErrors ? [...withMarker, "error"] : withMarker;
+    const withCommit = hasCommits ? [...withMarker, "commit"] : withMarker;
+    const cols = hasErrors ? [...withCommit, "error"] : withCommit;
 
     const widths = Object.fromEntries(
         cols.map(c => [c, Math.max(headers[c as keyof typeof headers].length, ...rows.map(r => r[c as keyof typeof r].length))])
@@ -408,6 +431,42 @@ function printActionResult(result: ActionResult, highlight?: Set<number>): void 
         process.exit(1);
     }
     printTable(result.processes, highlight);
+}
+
+// One line per deploy, plus the git/build output for failures (or always, with verbose).
+function printDeploys(result: { deploys?: DeployResult[]; processes?: ProcessInfo[] }, verbose = false): boolean {
+    const deploys = result.deploys ?? [];
+    const tty = process.stdout.isTTY;
+    const short = (sha?: string) => sha ? sha.slice(0, 7) : "?";
+    let allOk = true;
+    for (const d of deploys) {
+        const name = result.processes?.find(p => p.id === d.id)?.name ?? `#${d.id}`;
+        let line: string;
+        if (!d.ok) {
+            allOk = false;
+            const rb = d.rolledBack ? ` (rolled back to ${short(d.commit)})` : "";
+            line = `✗ ${name}: ${d.error}${rb}`;
+            line = tty ? COLOR.red(line) : line;
+        } else if (!d.changed) {
+            line = `· ${name}: already up to date (${short(d.commit)})`;
+            line = tty ? COLOR.dim(line) : line;
+        } else {
+            const from = d.previousCommit ? `${short(d.previousCommit)} → ` : "cloned at ";
+            line = `✓ ${name}: ${from}${short(d.commit)}`;
+            line = tty ? COLOR.green(line) : line;
+        }
+        if (verbose || !d.ok) {
+            const out = d.output.trimEnd();
+            if (out) console.log((tty ? COLOR.dim(out) : out) + "\n");
+        }
+        console.log(line);
+        if (d.ok && d.inferredGit) {
+            const msg = `  now git-backed: ${d.inferredGit.repo.replace(/(\/\/)[^/@\s]+@/g, "$1***@")} (${d.inferredGit.branch})`;
+            console.log(tty ? COLOR.dim(msg) : msg);
+        }
+    }
+    if (deploys.length) console.log("");
+    return allOk;
 }
 
 async function interactiveNew(): Promise<ProcessOptions | null> {
@@ -465,6 +524,21 @@ async function interactiveNew(): Promise<ProcessOptions | null> {
         if (eq !== -1) env[kv.slice(0, eq)] = kv.slice(eq + 1);
     }
 
+    const repo = await p.text({ message: "Git repo URL", placeholder: "leave blank to skip (cwd is cloned into if missing/empty)" });
+    if (p.isCancel(repo)) { p.cancel("Cancelled."); return null; }
+
+    let git: ProcessOptions["git"];
+    let build: string[] | undefined;
+    if ((repo as string)?.trim()) {
+        const branch = await p.text({ message: "Branch", defaultValue: "main", placeholder: "main" });
+        if (p.isCancel(branch)) { p.cancel("Cancelled."); return null; }
+        git = { repo: (repo as string).trim(), branch: (branch as string) || "main" };
+
+        const buildRaw = await p.text({ message: "Build commands, separated by ;", placeholder: "bun install; bun run build  (leave blank to skip)" });
+        if (p.isCancel(buildRaw)) { p.cancel("Cancelled."); return null; }
+        build = toCommandList(((buildRaw as string) ?? "").split(";"));
+    }
+
     const config: ProcessOptions = {
         name: name as string,
         cwd,
@@ -473,6 +547,8 @@ async function interactiveNew(): Promise<ProcessOptions | null> {
         ...(autoRestart && { restart: true }),
         ...(maxRestarts !== undefined && { maxRestarts }),
         ...(Object.keys(env).length && { env }),
+        ...(git && { git }),
+        ...(build && { build }),
     };
 
     const saveEco = await p.confirm({ message: "Save to ecosystem file?" });
@@ -520,6 +596,9 @@ program
     .option("--restart", "Auto-restart on crash")
     .option("--max-restarts <n>", "Max restart attempts", Number)
     .option("--env <kv...>", "Environment variables as KEY=VALUE")
+    .option("--git <repo>", "Git repo to clone into cwd and deploy from (new process)")
+    .option("--branch <branch>", "Git branch (default: main)")
+    .option("--build <cmd...>", "Build commands run after every clone/fetch, e.g. --build \"bun install\" \"bun run build\"")
     .option("--efile [path]", "Start from ecosystem file (auto-detects ecosystem.config.js/json if no path given)")
     .action(async (getter: string | undefined, opts) => {
         await ensureDaemon();
@@ -567,6 +646,7 @@ program
                     lastResult = await client.start(app);
                     for (const id of lastResult.affected) affected.add(id);
                     s.stop(app.name);
+                    printDeploys(lastResult);
                 }
                 printActionResult(lastResult, affected);
                 return;
@@ -590,11 +670,14 @@ program
                 ...(opts.restart && { restart: true }),
                 ...(opts.maxRestarts !== undefined && { maxRestarts: opts.maxRestarts }),
                 ...(Object.keys(env).length && { env }),
+                ...(opts.git && { git: { repo: opts.git, ...(opts.branch && { branch: opts.branch }) } }),
+                ...(toCommandList(opts.build) && { build: toCommandList(opts.build) }),
             };
             const s = p.spinner();
-            s.start(`Starting ${config.name}`);
+            s.start(config.git ? `Cloning, building and starting ${config.name}` : `Starting ${config.name}`);
             const result = await client.start(config);
             s.stop(`Started ${config.name}`);
+            printDeploys(result);
             printActionResult(result, new Set(result.affected));
             return;
         }
@@ -606,6 +689,7 @@ program
         s.start(`Starting ${newProc.name}`);
         const result = await client.start(newProc);
         s.stop(`Started ${newProc.name}`);
+        printDeploys(result);
         printActionResult(result, new Set(result.affected));
     });
 
@@ -688,7 +772,7 @@ program
             if (msg.type === "out" && showOut) process.stdout.write(msg.line);
             if (msg.type === "err" && showErr) process.stderr.write(process.stderr.isTTY ? COLOR.red(msg.line) : msg.line);
         }, controller.signal).catch(e => {
-            if (isAxiosError(e) && e.code === "ERR_CANCELED") return;
+            if ((e as Error)?.name === "AbortError") return;
             throw e;
         });
     });
@@ -739,6 +823,222 @@ program
         }
 
         console.log(`Updated to v${release.version}.`);
+    });
+
+program
+    .command("deploy <getter>")
+    .description("Pull (or clone) the latest commit for git-backed processes, run their build commands, and restart them if the commit changed")
+    .option("-f, --force", "Rebuild and restart even if already up to date")
+    .option("-v, --verbose", "Print git/build output for successful deploys too")
+    .action(async (getter: string, opts) => {
+        await ensureDaemon();
+        const s = p.spinner();
+        s.start(`Deploying ${getter}`);
+        const result = await client.deploy(getter, { force: !!opts.force });
+        s.stop(`Deployed ${getter}`);
+        if (result.deploys.length === 0) {
+            console.log(getter === "all" ? "No git-backed processes." : `No process matches "${getter}".`);
+            return;
+        }
+        const ok = printDeploys(result, !!opts.verbose);
+        printActionResult(result, new Set(result.affected));
+        if (!ok) process.exitCode = 1;
+    });
+
+// ── Daemon settings: auth / bind address ─────────────────────────────────────
+
+const PUBLIC_NO_AUTH_WARNING = "auth is disabled and pdd is listening on 0.0.0.0: anyone who can reach port 3830 can run commands on this machine";
+
+function discoveryLabel(cfg: DaemonConfig): string {
+    if (!cfg.discoverable) return "off";
+    return cfg.host === "0.0.0.0" ? "on" : "on (inactive while local)";
+}
+
+function hostLabel(host: string): string {
+    return host === "0.0.0.0" ? "public (0.0.0.0)" : "local (127.0.0.1)";
+}
+
+function printDaemonConfig(cfg: DaemonConfig): void {
+    const tty = process.stdout.isTTY;
+    const auth = cfg.authEnabled ? "enabled" : "disabled";
+    console.log(`auth:   ${tty ? (cfg.authEnabled ? COLOR.green(auth) : COLOR.yellow(auth)) : auth}`);
+    console.log(`listen: ${hostLabel(cfg.host)}`);
+    console.log(`broadcast: ${discoveryLabel(cfg)}`);
+    if (!cfg.authEnabled && cfg.host === "0.0.0.0") warn(PUBLIC_NO_AUTH_WARNING);
+}
+
+function warn(msg: string): void {
+    process.stderr.write((process.stderr.isTTY ? COLOR.yellow(`warning: ${msg}`) : `warning: ${msg}`) + "\n");
+}
+
+// The token is read from the daemon's config.json rather than over the API, so it
+// works even with auth enabled and never crosses the network.
+function printToken(): void {
+    const token = readLocalToken();
+    if (!token) {
+        process.stderr.write(`error: could not read the token from ${localConfigPath()}\n`);
+        process.exit(1);
+    }
+    console.log(token);
+}
+
+// After a rebind the old listener is gone and the new one may take a moment.
+async function waitForDaemon(): Promise<boolean> {
+    for (let i = 0; i < 20; i++) {
+        await Bun.sleep(150);
+        try {
+            await client.list();
+            return true;
+        } catch {}
+    }
+    return false;
+}
+
+async function setHost(mode: "local" | "public"): Promise<DaemonConfig> {
+    const cfg = await client.setHost(mode);
+    if (!await waitForDaemon()) {
+        process.stderr.write("error: pdd did not come back after switching its listen address\n  → check: journalctl -u pdd -n 50\n");
+        process.exit(1);
+    }
+    return cfg;
+}
+
+const auth = program.command("auth").description("Manage API token authentication");
+
+auth.command("token")
+    .description("Print the API token")
+    .action(async () => {
+        await ensureDaemon();
+        printToken();
+    });
+
+auth.command("status")
+    .description("Show whether auth is enabled and where pdd is listening")
+    .action(async () => {
+        await ensureDaemon();
+        printDaemonConfig(await client.getDaemonConfig());
+    });
+
+auth.command("enable")
+    .description("Require the API token on every request")
+    .action(async () => {
+        await ensureDaemon();
+        printDaemonConfig(await client.setAuthEnabled(true));
+    });
+
+auth.command("disable")
+    .description("Allow requests without a token")
+    .action(async () => {
+        await ensureDaemon();
+        printDaemonConfig(await client.setAuthEnabled(false));
+    });
+
+auth.command("rotate")
+    .description("Generate a new API token (remote clients must be given the new one)")
+    .action(async () => {
+        await ensureDaemon();
+        const cfg = await client.rotateToken();
+        console.log(cfg.token);
+        if (!cfg.authEnabled) warn("auth is currently disabled, so the token isn't being enforced (pd auth enable)");
+    });
+
+program
+    .command("server [mode] [value]")
+    .description("Show or set where pdd listens (local = 127.0.0.1, public = 0.0.0.0), or toggle LAN discovery (broadcast on|off)")
+    .action(async (mode: string | undefined, value: string | undefined) => {
+        await ensureDaemon();
+        if (mode === undefined || mode === "status") {
+            printDaemonConfig(await client.getDaemonConfig());
+            return;
+        }
+        if (mode === "broadcast") {
+            if (value !== "on" && value !== "off") {
+                process.stderr.write(`error: expected "pd server broadcast on" or "pd server broadcast off"\n`);
+                process.exit(1);
+            }
+            const cfg = await client.setDiscoverable(value === "on");
+            printDaemonConfig(cfg);
+            if (cfg.discoverable && cfg.host !== "0.0.0.0") warn("pdd only answers discovery while public (pd server public)");
+            return;
+        }
+        if (mode !== "local" && mode !== "public") {
+            process.stderr.write(`error: unknown mode "${mode}" (expected local, public, or broadcast on|off)\n`);
+            process.exit(1);
+        }
+        printDaemonConfig(await setHost(mode));
+    });
+
+program
+    .command("discover")
+    .description("Find pdd daemons on the local network (ones that are public with broadcast on)")
+    .option("-t, --timeout <ms>", "How long to wait for replies", Number, 1500)
+    .action(async (opts) => {
+        const s = p.spinner();
+        s.start("Looking for pdd on the network");
+        const found = await discover({ timeoutMs: opts.timeout });
+        s.stop(`Found ${found.length} daemon${found.length === 1 ? "" : "s"}`);
+        if (found.length === 0) return;
+        const rows = found.map(d => ({ host: d.hostname, url: `http://${d.address}:${d.port}`, version: d.version, auth: d.authEnabled ? "on" : "off" }));
+        const headers = { host: "HOST", url: "URL", version: "VERSION", auth: "AUTH" };
+        const cols = Object.keys(headers) as (keyof typeof headers)[];
+        const w = Object.fromEntries(cols.map(c => [c, Math.max(headers[c].length, ...rows.map(r => r[c].length))])) as Record<string, number>;
+        console.log(cols.map(c => headers[c].padEnd(w[c]!)).join("  "));
+        console.log(cols.map(c => "─".repeat(w[c]!)).join("  "));
+        for (const r of rows) console.log(cols.map(c => r[c].padEnd(w[c]!)).join("  "));
+    });
+
+program
+    .command("config")
+    .description("Interactively change pdd's settings (auth, listen address, token)")
+    .action(async () => {
+        await ensureDaemon();
+        p.intro("pdd settings");
+        while (true) {
+            const cfg = await client.getDaemonConfig();
+            if (!cfg.authEnabled && cfg.host === "0.0.0.0") p.log.warn(PUBLIC_NO_AUTH_WARNING);
+            const choice = await p.select({
+                message: "What do you want to change?",
+                options: [
+                    { value: "auth", label: `Auth: ${cfg.authEnabled ? "enabled" : "disabled"}`, hint: cfg.authEnabled ? "disable" : "enable" },
+                    { value: "host", label: `Listen: ${hostLabel(cfg.host)}`, hint: cfg.host === "0.0.0.0" ? "switch to local" : "switch to public" },
+                    { value: "broadcast", label: `Broadcast: ${discoveryLabel(cfg)}`, hint: cfg.discoverable ? "turn off" : "turn on" },
+                    { value: "token", label: "Show token" },
+                    { value: "rotate", label: "Rotate token" },
+                    { value: "done", label: "Done" },
+                ],
+            });
+            if (p.isCancel(choice) || choice === "done") break;
+
+            if (choice === "auth") {
+                if (cfg.authEnabled && cfg.host === "0.0.0.0") {
+                    const ok = await p.confirm({ message: "pdd is listening publicly. Disabling auth lets anyone who can reach it run commands. Continue?", initialValue: false });
+                    if (p.isCancel(ok) || !ok) continue;
+                }
+                await client.setAuthEnabled(!cfg.authEnabled);
+                p.log.success(`Auth ${cfg.authEnabled ? "disabled" : "enabled"}`);
+            } else if (choice === "host") {
+                const next = cfg.host === "0.0.0.0" ? "local" : "public";
+                if (next === "public" && !cfg.authEnabled) {
+                    const ok = await p.confirm({ message: "Auth is disabled. Going public lets anyone who can reach port 3830 run commands. Continue?", initialValue: false });
+                    if (p.isCancel(ok) || !ok) continue;
+                }
+                await setHost(next);
+                p.log.success(`Now listening on ${hostLabel(next === "public" ? "0.0.0.0" : "127.0.0.1")}`);
+            } else if (choice === "broadcast") {
+                const next = await client.setDiscoverable(!cfg.discoverable);
+                p.log.success(`Broadcast ${discoveryLabel(next)}`);
+            } else if (choice === "token") {
+                const token = readLocalToken();
+                if (token) p.note(token, "API token");
+                else p.log.error(`could not read the token from ${localConfigPath()}`);
+            } else if (choice === "rotate") {
+                const ok = await p.confirm({ message: "Rotate the token? Remote clients (e.g. auto-deploy on another machine) will need the new one.", initialValue: false });
+                if (p.isCancel(ok) || !ok) continue;
+                const result = await client.rotateToken();
+                p.note(result.token, "New API token");
+            }
+        }
+        p.outro("Done");
     });
 
 program.parseAsync(process.argv);

@@ -1,6 +1,7 @@
 import fs from "fs/promises";
-import { Status, type ProcessOptions, type ProcessInfo, type Getter, type Actions, type ActionResult } from "../types";
+import { Status, type ProcessOptions, type ProcessInfo, type Getter, type Actions, type ActionResult, type DeployActionResult, type DeployInfo, type DeployResult } from "../types";
 import { Process, killOrphan } from "./process";
+import { deployProcess } from "./deploy";
 
 const procs: ProcessInfo[] = [];
 
@@ -17,7 +18,12 @@ async function save() {
     await fs.rename(tmpPath, saveFilePath);
 }
 
-function createProcess(project: ProcessOptions, projectID: number = getNextProcessNumber(), initialLogFiles: string[] = []): ProcessInfo & { process: Process } {
+function createProcess(
+    project: ProcessOptions,
+    projectID: number = getNextProcessNumber(),
+    initialLogFiles: string[] = [],
+    restored: { commit?: string; lastDeploy?: DeployInfo } = {},
+): ProcessInfo & { process: Process } {
     const proc = new Process({
         cwd: project.cwd,
         name: project.name,
@@ -26,7 +32,11 @@ function createProcess(project: ProcessOptions, projectID: number = getNextProce
         script: project.script,
         restart: project.restart,
         maxRestarts: project.maxRestarts,
+        git: project.git,
+        build: project.build,
     }, projectID, initialLogFiles);
+    proc.commit = restored.commit;
+    proc.lastDeploy = restored.lastDeploy;
 
     const procInfo: ProcessInfo = {
         startOptions: project,
@@ -48,6 +58,12 @@ function createProcess(project: ProcessOptions, projectID: number = getNextProce
         },
         get logFiles() {
             return proc.logFiles;
+        },
+        get commit() {
+            return proc.commit;
+        },
+        get lastDeploy() {
+            return proc.lastDeploy;
         },
     }
 
@@ -92,7 +108,10 @@ async function respawn() {
         const lastPid = project.pid ?? project.monit?.pid;
         const reclaimed = lastPid ? await killOrphan(lastPid) : true;
 
-        const procInfo = createProcess(project.startOptions, project.id, project.logFiles ?? []);
+        const procInfo = createProcess(project.startOptions, project.id, project.logFiles ?? [], {
+            commit: project.commit,
+            lastDeploy: project.lastDeploy,
+        });
 
         if (!reclaimed) {
             // The old pid might still be holding the port (or anything else it
@@ -134,6 +153,15 @@ async function doAction(getter: Getter, action: Actions) {
     return projects;
 }
 
+// Daemon shutdown only. Stops every child directly instead of going through
+// doAction(), which would record lastAction = "stop" on each and make the next
+// boot's respawn() leave everything stopped (e.g. after `systemctl restart pdd`
+// or `pd update`). Leaving lastAction alone means respawn() brings back exactly
+// what was running before.
+async function stopAllForShutdown(): Promise<void> {
+    await Promise.all(procs.map(p => p.process?.stop()));
+}
+
 async function start(options: Getter | ProcessOptions): Promise<ActionResult> {
     if (typeof options === "number" || typeof options === "string") {
         // Custom logic
@@ -143,9 +171,58 @@ async function start(options: Getter | ProcessOptions): Promise<ActionResult> {
 
     const procInfo = createProcess(options);
 
+    // A git-backed process clones + builds before its first spawn, so a brand new
+    // node can be set up with a single POST /start.
+    if (options.git) {
+        const result = await deployProcess(procInfo.process);
+        if (!result.ok) {
+            // Left without a lastAction so respawn() doesn't keep retrying a broken
+            // checkout on every daemon boot; `pd deploy` fixes it up.
+            procInfo.process.status = Status.Error;
+            procInfo.process.lastError = `deploy failed: ${result.error}`;
+            return { affected: [procInfo.id], processes: await list(), deploys: [result] };
+        }
+        await procInfo.process.start();
+        procInfo.lastAction = "start";
+        return { affected: [procInfo.id], processes: await list(), deploys: [result] };
+    }
+
     await procInfo.process.start();
     procInfo.lastAction = "start";
     return { affected: [procInfo.id], processes: await list() };
+}
+
+// Deploys run one process at a time (not Promise.all like the other actions):
+// "deploy all" on a small node shouldn't run every app's build concurrently.
+async function deploy(getter: Getter, force = false): Promise<DeployActionResult> {
+    // "all" means every git-backed process; naming a non-git one explicitly is
+    // reported as an error in its DeployResult instead of being silently skipped.
+    const projects = getProjects(getter).filter(p => getter !== "all" || p.startOptions.git);
+    const deploys: DeployResult[] = [];
+    for (const p of projects) {
+        if (!p.process) continue;
+        // Inferring git config from an existing checkout only for an explicitly
+        // named process: "all" must never start hard-resetting checkouts that
+        // were never opted in.
+        const result = await deployProcess(p.process, { force, inferGit: getter !== "all" });
+        deploys.push(result);
+        if (result.ok && result.inferredGit) p.startOptions.git = result.inferredGit;
+        if (!result.ok) {
+            // The old code is still running (or rolled back); flag it in `pd ls`.
+            p.process.lastError = `deploy failed: ${result.error}`;
+            continue;
+        }
+        if (p.process.lastError?.startsWith("deploy failed")) p.process.lastError = undefined;
+        const status = p.process.status;
+        // Stopped stays stopped (the new code is picked up on the next start).
+        // Error is included: the new commit may well be the fix for a crash loop,
+        // or the first successful clone for a process whose cwd was missing.
+        if (result.changed && (status === Status.Online || status === Status.Starting || status === Status.Error)) {
+            p.lastAction = "restart";
+            await p.process.restart();
+        }
+    }
+    return { affected: projects.map(p => p.id), processes: await list(), deploys };
 }
 
 async function stop(getter: Getter): Promise<ActionResult> {
@@ -184,6 +261,25 @@ async function updateEnv(getter: Getter, envVars: Record<string, string>, replac
     return { affected: projects.map(p => p.id), processes: await list() };
 }
 
+// Patches the stored ProcessOptions (name, cwd, script, interpreter, restart,
+// maxRestarts, env) in place. Like updateEnv(), options are only read at spawn
+// time, so a running process is restarted to apply them.
+async function updateConfig(getter: Getter, patch: Partial<ProcessOptions>): Promise<ActionResult> {
+    const projects = getProjects(getter);
+    await Promise.all(
+        projects.map(async p => {
+            if (!p.process) return;
+            p.process.setOptions(patch);
+            p.startOptions = { ...p.startOptions, ...patch };
+            if (p.process.status === Status.Online || p.process.status === Status.Starting) {
+                p.lastAction = "restart";
+                await p.process.restart();
+            }
+        })
+    );
+    return { affected: projects.map(p => p.id), processes: await list() };
+}
+
 async function list() {
     await Promise.all(procs.map(v => v.process?.getResourceUsage()));
     return [...procs];
@@ -193,9 +289,12 @@ const proc = {
     getProjects,
     start,
     stop,
+    stopAllForShutdown,
     restart,
     remove,
     env: updateEnv,
+    deploy,
+    config: updateConfig,
     list,
     save,
     respawn

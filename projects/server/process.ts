@@ -1,6 +1,6 @@
 import pidusage from "pidusage";
 
-import { Status, type ProcessOptions, type ProcessOptionsConfirmed, type Stat } from "../types.ts";
+import { Status, type DeployInfo, type ProcessOptions, type ProcessOptionsConfirmed, type Stat } from "../types.ts";
 import path from "path";
 import fs from "fs/promises";
 import { existsSync, createWriteStream } from "fs";
@@ -104,6 +104,12 @@ export class Process extends EventEmitter {
     private stableTimer?: ReturnType<typeof setTimeout>;
 
     public monit?: Stat;
+
+    // Deploy state (see deploy.ts). `deploying` is the per-process lock so two
+    // overlapping deploys can't interleave git resets and builds in the same cwd.
+    public deploying = false;
+    public commit?: string;
+    public lastDeploy?: DeployInfo;
 
     constructor(info: ProcessOptions, id: number, initialLogFiles: string[] = []) {
         super();
@@ -356,6 +362,15 @@ export class Process extends EventEmitter {
     // running process; callers that want the change applied immediately restart it.
     setEnv(env: Record<string, string>, replace = false) {
         this.info.env = replace ? { ...env } : { ...this.info.env, ...env };
+    }
+
+    // Applies a partial config patch for the *next* spawn, with the same defaults
+    // as the constructor. Like setEnv(), a running child is left alone.
+    setOptions(patch: Partial<ProcessOptions>) {
+        const next = { ...this.info, ...patch };
+        if (!next.script?.trim()) next.script = ".";
+        next.interpreter ||= "bun";
+        this.info = next as ProcessOptionsConfirmed;
     }
 
     async remove() {
