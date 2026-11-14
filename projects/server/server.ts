@@ -4,14 +4,18 @@ import { existsSync } from "fs";
 import proc from "./manager"
 import { isAlive } from "./process";
 import { startDiscoveryResponder } from "./discovery";
+import { FileError, listDir, readText, writeText } from "./files";
+import { runCommand } from "./exec";
+import { VERSION, initSelfUpdate, status as updateStatus, update as selfUpdate } from "./selfupdate";
 import { PORT, getConfig, loadConfig, publicView, saveConfig, tokenMatches, updateConfig, generateToken } from "./config";
-import type { BindHost, ProcessOptions } from "../types";
+import type { BindHost, ExecOptions, ProcessOptions } from "../types";
 // Inlined as a string at build time, so the compiled pdd binary carries the
 // dashboard with it and never reads it from disk.
 import dashboardHtml from "./dashboard.html" with { type: "text" };
 
 const app = express();
-app.use(express.json());
+// Big enough for PUT /file (5MB of text, plus JSON escaping).
+app.use(express.json({ limit: "12mb" }));
 
 loadConfig();
 // Persist immediately so a freshly generated token is on disk for `pd` and the
@@ -203,8 +207,32 @@ app.post("/deploy/:getter", asyncRoute<{ getter: string }>(async (req, res) => {
 // one; local tools read it from config.json.
 
 app.get("/daemon", (_req, res) => {
-    res.json(publicView());
+    res.json({ ...publicView(), version: VERSION });
 });
+
+app.post("/daemon/auto-update", asyncRoute(async (req, res) => {
+    const { enabled } = (req.body ?? {}) as { enabled?: boolean };
+    if (typeof enabled !== "boolean") return res.status(400).json({ error: "enabled must be a boolean" });
+    res.json(publicView(await updateConfig({ autoUpdate: enabled })));
+}));
+
+// ?check=1 asks GitHub for the latest release first.
+app.get("/daemon/update", asyncRoute(async (req, res) => {
+    res.json(await updateStatus(req.query.check === "1" || req.query.check === "true"));
+}));
+
+// Installs the latest signed release and restarts into it (managed processes
+// are stopped and brought back like on any daemon restart). Answers before the
+// restart; poll GET /daemon until the version changes.
+app.post("/daemon/update", asyncRoute(async (req, res) => {
+    const { force } = (req.body ?? {}) as { force?: boolean };
+    try {
+        const result = await selfUpdate({ force: !!force });
+        res.status(result.started ? 202 : 200).json(result);
+    } catch (err) {
+        res.status(502).json({ started: false, error: err instanceof Error ? err.message : String(err) });
+    }
+}));
 
 app.post("/daemon/auth", asyncRoute(async (req, res) => {
     const { enabled } = (req.body ?? {}) as { enabled?: boolean };
@@ -238,6 +266,60 @@ app.post("/daemon/host", asyncRoute(async (req, res) => {
     // connection torn down instead of the answer.
     if (host !== previous) res.on("finish", () => void rebind(host, previous));
     res.json(publicView(config));
+}));
+
+// ── Run a command ───────────────────────────────────────────────────────────
+// One-off shell command, in a process's cwd (with its env) or a given dir.
+
+app.post("/exec", asyncRoute(async (req, res) => {
+    const body = (req.body ?? {}) as ExecOptions;
+    if (typeof body.command !== "string" || !body.command.trim()) return res.status(400).json({ error: "command is required" });
+    let cwd = typeof body.cwd === "string" && body.cwd ? body.cwd : undefined;
+    let env: Record<string, string> = {};
+    if (body.getter !== undefined && body.getter !== "") {
+        const matches = proc.getProjects(String(body.getter));
+        if (matches.length !== 1) return res.status(matches.length ? 400 : 404).json({ error: matches.length ? "getter matches more than one process; use its id" : "No project found with that getter" });
+        cwd = matches[0]!.startOptions.cwd;
+        env = matches[0]!.startOptions.env ?? {};
+    }
+    if (cwd && !existsSync(cwd)) return res.status(400).json({ error: `directory does not exist: ${cwd}` });
+    res.json(await runCommand(body.command, cwd, env, typeof body.timeoutMs === "number" ? body.timeoutMs : undefined));
+}));
+
+// ── Files ───────────────────────────────────────────────────────────────────
+// Read/write text files inside one process's cwd (?path= is relative to it).
+// The getter has to match exactly one process.
+
+function oneProcessCwd(getter: string, res: express.Response): string | undefined {
+    const matches = proc.getProjects(getter);
+    if (matches.length !== 1) {
+        res.status(matches.length ? 400 : 404).json({ error: matches.length ? `"${getter}" matches ${matches.length} processes; use its id` : "No project found with that getter" });
+        return;
+    }
+    return matches[0]!.startOptions.cwd;
+}
+
+function fileRoute<P extends { getter: string }>(handler: (cwd: string, sub: string, req: express.Request<P>, res: express.Response) => Promise<unknown>) {
+    return asyncRoute<P>(async (req, res) => {
+        const cwd = oneProcessCwd(req.params.getter, res);
+        if (cwd === undefined) return;
+        const sub = typeof req.query.path === "string" ? req.query.path : "";
+        try {
+            res.json(await handler(cwd, sub, req, res));
+        } catch (err) {
+            if (err instanceof FileError) return res.status(err.status).json({ error: err.message });
+            throw err;
+        }
+    });
+}
+
+app.get("/files/:getter", fileRoute<{ getter: string }>((cwd, sub) => listDir(cwd, sub)));
+app.get("/file/:getter", fileRoute<{ getter: string }>((cwd, sub) => readText(cwd, sub)));
+app.put("/file/:getter", fileRoute<{ getter: string }>(async (cwd, sub, req) => {
+    const content = (req.body as { content?: unknown })?.content;
+    if (typeof content !== "string") throw new FileError(400, "body must be { content: string }");
+    if (!sub) throw new FileError(400, "path is required");
+    return writeText(cwd, sub, content);
 }));
 
 app.get("/logs/:id",asyncRoute<{ id: string }>(async (req, res) => {
@@ -339,7 +421,7 @@ if (!getConfig().authEnabled && getConfig().host === "0.0.0.0") {
 // plain `systemctl stop`). Bounded so a child ignoring SIGTERM can't hang the
 // daemon's own shutdown; killOrphan() on the next respawn() cleans up anything
 // that doesn't die in time.
-async function shutdown(signal: string) {
+async function shutdown(signal: string, exitCode = 0) {
     console.log(`[pdd] received ${signal}, stopping managed processes...`);
     try {
         await Promise.race([
@@ -353,8 +435,12 @@ async function shutdown(signal: string) {
     // Clean up so a future pid reused by an unrelated process doesn't fool the
     // next startup's singleton check into thinking it's still us.
     await fs.unlink(pidFilePath).catch(() => {});
-    process.exit(0);
+    process.exit(exitCode);
 }
+
+// A self-update restarts by exiting non-zero after a clean shutdown, so systemd
+// brings the new binary up whether the unit says Restart=always or on-failure.
+await initSelfUpdate(() => shutdown("self-update", 75));
 
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 process.on("SIGINT", () => void shutdown("SIGINT"));

@@ -7,7 +7,11 @@ import type {
     DaemonConfig,
     DaemonConfigWithToken,
     DeployActionResult,
+    UpdateStatus,
     DiscoveredDaemon,
+    ExecOptions,
+    ExecResult,
+    FileEntry,
     Getter,
     LogStreamMessage,
     ProcessInfo,
@@ -212,6 +216,49 @@ export class ProcClient {
     async logs(getter: Getter, options?: { runs?: number }): Promise<{ out: string, err: string }> {
         const qs = options?.runs !== undefined ? `?runs=${options.runs}` : "";
         return this.get(`/logs/${getter}${qs}`);
+    }
+
+    // ── Files (inside a process's cwd; `path` is relative to it) ─────────────
+
+    async listFiles(getter: Getter, path = ""): Promise<FileEntry[]> {
+        return this.get(`/files/${encodeURIComponent(String(getter))}?path=${encodeURIComponent(path)}`);
+    }
+
+    // Text files up to 2MB; binary files are refused.
+    async readFile(getter: Getter, path: string): Promise<{ content: string; size: number }> {
+        return this.get(`/file/${encodeURIComponent(String(getter))}?path=${encodeURIComponent(path)}`);
+    }
+
+    // Creates or replaces the file (atomically). The parent directory must exist.
+    async writeFile(getter: Getter, path: string, content: string): Promise<{ size: number; created: boolean }> {
+        return this.json(await this.request("PUT", `/file/${encodeURIComponent(String(getter))}?path=${encodeURIComponent(path)}`, { content }));
+    }
+
+    // Runs one shell command on the daemon's machine and returns its output.
+    // Waits for the command (up to its timeout, default 60s, max 10 min).
+    async exec(options: ExecOptions): Promise<ExecResult> {
+        const limit = Math.min(options.timeoutMs ?? 60_000, 600_000);
+        return this.post("/exec", options, limit + 10_000);
+    }
+
+    // ── Self-update ──────────────────────────────────────────────────────────
+
+    async getUpdateStatus(options?: { check?: boolean }): Promise<UpdateStatus> {
+        return this.get(`/daemon/update${options?.check ? "?check=1" : ""}`, 20_000);
+    }
+
+    // Installs the latest signed release and restarts the daemon into it.
+    // `started: false` with a reason when there's nothing to do or it can't.
+    async updateDaemon(options?: { force?: boolean }): Promise<{ started: boolean; from: string; to?: string; reason?: string; error?: string }> {
+        const res = await this.request("POST", "/daemon/update", { force: !!options?.force }, { timeout: 5 * 60_000 });
+        const text = await res.text();
+        const data = text ? JSON.parse(text) : {};
+        if (!res.ok && res.status !== 502) throw new ProcClientError(res.status, data);
+        return data;
+    }
+
+    async setAutoUpdate(enabled: boolean): Promise<DaemonConfig> {
+        return this.post("/daemon/auto-update", { enabled });
     }
 
     // ── Daemon settings ──────────────────────────────────────────────────────

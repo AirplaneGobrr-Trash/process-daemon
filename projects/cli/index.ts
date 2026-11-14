@@ -13,7 +13,8 @@ import {
     CURRENT_VERSION,
     compareVersions,
     fetchLatestRelease,
-    installUpdate,
+    migrateAndInstall,
+    noteInstalled,
     printUpdateNagIfAvailable,
     refreshUpdateCacheIfStale,
 } from "./update";
@@ -779,8 +780,9 @@ program
 
 program
     .command("update")
-    .description("Update pd and pdd to the latest GitHub release")
+    .description("Update pd and pdd to the latest signed GitHub release")
     .option("-y, --yes", "Skip the confirmation prompt")
+    .option("-f, --force", "Reinstall even if already up to date")
     .action(async (opts) => {
         const s = p.spinner();
         s.start("Checking for updates");
@@ -794,35 +796,90 @@ program
         }
         s.stop(`Latest release: ${release.tag}`);
 
-        if (compareVersions(release.version, CURRENT_VERSION) <= 0) {
+        // Is the local daemon already in the self-updating layout?
+        let selfUpdatable = false;
+        let reason: string | undefined;
+        try {
+            const st = await client.getUpdateStatus();
+            selfUpdatable = st.canSelfUpdate;
+            reason = st.reason;
+        } catch {
+            // Daemon down, or older than 1.5 (no update API): migrate.
+        }
+
+        const newer = compareVersions(release.version, CURRENT_VERSION) > 0;
+        if (!newer && !opts.force && selfUpdatable) {
             console.log(`Already up to date (v${CURRENT_VERSION}).`);
             return;
         }
 
-        console.log(`\n${release.name}  (v${CURRENT_VERSION} → v${release.version})\n`);
-        if (release.body.trim()) {
-            console.log(release.body.trim());
-            console.log("");
+        if (newer) {
+            console.log(`\n${release.name}  (v${CURRENT_VERSION} → v${release.version})\n`);
+            if (release.body.trim()) console.log(release.body.trim() + "\n");
+        } else if (!selfUpdatable) {
+            console.log(`\nUp to date (v${CURRENT_VERSION}), but self-updates aren't set up yet${reason ? `: ${reason}` : ""}.\n`);
+        }
+
+        if (selfUpdatable) {
+            if (!opts.yes) {
+                const ok = await p.confirm({ message: "Install it? pdd restarts into the new version (managed processes restart briefly)." });
+                if (p.isCancel(ok) || !ok) return p.cancel("Cancelled.");
+            }
+            const r = await client.updateDaemon({ force: !!opts.force });
+            if (!r.started) {
+                process.stderr.write(`error: ${r.error ?? r.reason ?? "update did not start"}\n`);
+                process.exit(1);
+            }
+            const wait = p.spinner();
+            wait.start(`Waiting for pdd v${r.to} to come back`);
+            for (let i = 0; i < 60; i++) {
+                await Bun.sleep(1000);
+                const cfg = await client.getDaemonConfig().catch(() => undefined);
+                if (cfg?.version === r.to) {
+                    wait.stop(`pdd is running v${r.to}`);
+                    await noteInstalled(release);
+                    return;
+                }
+            }
+            wait.stop("pdd hasn't come back on the new version yet");
+            process.stderr.write("check `systemctl status pdd`; a version that won't start is rolled back automatically after a few tries\n");
+            process.exit(1);
         }
 
         if (!opts.yes) {
-            const confirmed = await p.confirm({
-                message: "Install this update? This overwrites the current pd/pdd binaries and restarts the pdd service.",
+            const ok = await p.confirm({
+                message: "Set up self-updating and install? This needs sudo once: it moves pd/pdd into /var/lib/pdd/bin, links them from /usr/local/bin, and updates the pdd service. After this, updates never need sudo.",
             });
-            if (p.isCancel(confirmed) || !confirmed) {
-                p.cancel("Cancelled.");
-                return;
-            }
+            if (p.isCancel(ok) || !ok) return p.cancel("Cancelled.");
         }
-
         try {
-            await installUpdate(release);
+            await migrateAndInstall(release);
         } catch (e) {
             process.stderr.write(`error: ${e instanceof Error ? e.message : e}\n`);
             process.exit(1);
         }
+        console.log(`Installed v${release.version}. pdd now updates itself (pd autoupdate on|off).`);
+    });
 
-        console.log(`Updated to v${release.version}.`);
+program
+    .command("autoupdate [state]")
+    .description("Show or set automatic updates (on|off): pdd installs new signed releases by itself")
+    .action(async (state: string | undefined) => {
+        await ensureDaemon();
+        if (state === undefined) {
+            const st = await client.getUpdateStatus({ check: true });
+            console.log(`version:     v${st.version}${st.latest ? ` (latest v${st.latest})` : ""}`);
+            console.log(`auto-update: ${st.autoUpdate ? "on" : "off"}`);
+            console.log(`self-update: ${st.canSelfUpdate ? "ready" : `not set up (${st.reason}); run pd update`}`);
+            if (st.last) console.log(`last update: ${st.last.ok ? "ok" : "FAILED"} ${st.last.at}${st.last.to ? ` -> v${st.last.to}` : ""}${st.last.error ? `: ${st.last.error}` : ""}`);
+            return;
+        }
+        if (state !== "on" && state !== "off") {
+            process.stderr.write(`error: expected "pd autoupdate on" or "pd autoupdate off"\n`);
+            process.exit(1);
+        }
+        const cfg = await client.setAutoUpdate(state === "on");
+        console.log(`auto-update: ${cfg.autoUpdate ? "on" : "off"}`);
     });
 
 program
@@ -864,6 +921,7 @@ function printDaemonConfig(cfg: DaemonConfig): void {
     console.log(`auth:   ${tty ? (cfg.authEnabled ? COLOR.green(auth) : COLOR.yellow(auth)) : auth}`);
     console.log(`listen: ${hostLabel(cfg.host)}`);
     console.log(`broadcast: ${discoveryLabel(cfg)}`);
+    if (cfg.autoUpdate !== undefined) console.log(`auto-update: ${cfg.autoUpdate ? "on" : "off"}`);
     if (!cfg.authEnabled && cfg.host === "0.0.0.0") warn(PUBLIC_NO_AUTH_WARNING);
 }
 

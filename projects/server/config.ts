@@ -36,6 +36,7 @@ export function loadConfig(): DaemonConfigWithToken {
         authEnabled: typeof stored.authEnabled === "boolean" ? stored.authEnabled : true,
         host: isBindHost(stored.host) ? stored.host : "127.0.0.1",
         discoverable: typeof stored.discoverable === "boolean" ? stored.discoverable : true,
+        autoUpdate: typeof stored.autoUpdate === "boolean" ? stored.autoUpdate : true,
         token: typeof stored.token === "string" && stored.token.length >= 32 ? stored.token : generateToken(),
     };
     return config;
@@ -61,7 +62,7 @@ export async function updateConfig(patch: Partial<DaemonConfigWithToken>): Promi
 }
 
 export function publicView(c: DaemonConfigWithToken = config): DaemonConfig {
-    return { authEnabled: c.authEnabled, host: c.host, discoverable: c.discoverable };
+    return { authEnabled: c.authEnabled, host: c.host, discoverable: c.discoverable, autoUpdate: c.autoUpdate };
 }
 
 // Constant-time so the token can't be guessed byte-by-byte from response timing.

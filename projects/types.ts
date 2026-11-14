@@ -94,6 +94,57 @@ export interface DaemonConfig {
     host: BindHost;
     // Answer `pd discover` UDP broadcasts. Only effective while host is 0.0.0.0.
     discoverable: boolean;
+    // Install new signed releases automatically (checked every 6h).
+    autoUpdate: boolean;
+    // Only in GET /daemon responses: the running pdd version.
+    version?: string;
+}
+
+export interface LastUpdate {
+    at: string;           // ISO timestamp
+    ok: boolean;
+    from?: string;
+    to?: string;
+    error?: string;
+    // The launcher put the previous binary back because the new one wouldn't start.
+    rolledBack?: boolean;
+}
+
+export interface UpdateStatus {
+    version: string;
+    // Set once a check has run (GET /daemon/update?check=1, or an update attempt).
+    latest?: string;
+    checkedAt?: string;
+    updateAvailable?: boolean;
+    checkError?: string;
+    autoUpdate: boolean;
+    updating: boolean;
+    // false (with `reason`) until the installer has moved pdd into its
+    // self-updatable layout (binaries in /var/lib/pdd/bin).
+    canSelfUpdate: boolean;
+    reason?: string;
+    last?: LastUpdate;
+}
+
+export interface ExecOptions {
+    command: string;
+    // Run in this process's cwd with its env (by id or name). Otherwise `cwd`,
+    // or the daemon user's home directory.
+    getter?: string | number;
+    cwd?: string;
+    // Default 60s, max 10 minutes.
+    timeoutMs?: number;
+}
+
+export interface ExecResult {
+    code: number | null;
+    stdout: string;
+    stderr: string;
+    timedOut: boolean;
+    durationMs: number;
+    cwd: string;
+    // Output beyond the cap (256KB per stream) was dropped from the start.
+    truncated: boolean;
 }
 
 // One reply to a discovery broadcast. Never includes the token.
@@ -116,6 +167,14 @@ export interface ActionResult {
     processes: ProcessInfo[];
     // only present when the action ran a deploy (POST /start with `git`)
     deploys?: DeployResult[];
+}
+
+// One entry from GET /files/:getter. Symlinks report what they point to.
+export interface FileEntry {
+    name: string;
+    type: "file" | "dir" | "other";
+    // bytes, files only
+    size?: number;
 }
 
 export interface LogStreamMessage {
